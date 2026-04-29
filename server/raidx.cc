@@ -1,5 +1,7 @@
 #include "../shared/common.h"
 
+static unsigned char g_raidx_gf_tbl[256][32];
+
 static char *g_bdev_name = (char*) "Nvme0n1";
 static int g_process_id = -1;
 static char *g_addr_file = (char*) "";
@@ -12,16 +14,54 @@ static struct bdev_context_t *g_bdev_context;
 static struct rte_hash *g_req_hash = NULL;
 static struct rte_hash *g_rc_hash = NULL;
 
+struct raidx_rc_hash_key {
+    uint64_t offset;
+    uint8_t data_index;
+    uint8_t reserved[7];
+};
+
+static struct raidx_rc_hash_key
+raidx_make_rc_hash_key(uint64_t offset, uint8_t data_index)
+{
+    struct raidx_rc_hash_key key = {};
+
+    key.offset = offset;
+    key.data_index = data_index;
+    return key;
+}
+
+static int
+raidx_rc_hash_lookup(uint64_t offset, uint8_t data_index, void **data)
+{
+    struct raidx_rc_hash_key key = raidx_make_rc_hash_key(offset, data_index);
+
+    return rte_hash_lookup_data(g_rc_hash, &key, data);
+}
+
+static int
+raidx_rc_hash_add(uint64_t offset, uint8_t data_index, void *data)
+{
+    struct raidx_rc_hash_key key = raidx_make_rc_hash_key(offset, data_index);
+
+    return rte_hash_add_key_data(g_rc_hash, &key, data);
+}
+
+static int
+raidx_rc_hash_del(uint64_t offset, uint8_t data_index)
+{
+    struct raidx_rc_hash_key key = raidx_make_rc_hash_key(offset, data_index);
+
+    return rte_hash_del_key(g_rc_hash, &key);
+}
+
 static struct ibv_cq* g_cq; // global CQ
 static struct rdma_qp_server *g_host_qp_list; // global host QP list
 static struct rdma_qp_server *g_server_qp_list; // global server QP list
 
 static struct spdk_poller *g_poller;
 
-static int host_qp_send_wr_budget();
-static int peer_qp_send_wr_budget();
-static int peer_qp_recv_wr_budget();
-static int server_cq_entries();
+void rdma_send_resp(struct send_wr_wrapper_server *send_wrapper, uint64_t req_id);
+void rdma_recv(struct recv_wr_wrapper_server *recv_wrapper);
 
 void show_buffer(unsigned char *buf, long buffer_size){
     char tmp[555];
@@ -48,6 +88,92 @@ raid5_xor_buf(void *to, void *from, size_t size)
     }
 }
 
+static uint8_t
+raidx_target_pos(enum target tgt)
+{
+    switch (tgt) {
+        case PEER1:
+            return 0;
+        case PEER2:
+            return 1;
+        case PEER3:
+            return 2;
+        case PEER4:
+            return 3;
+        default:
+            SPDK_ERRLOG("Illegal target enum: %d\n", tgt);
+            assert(false);
+    }
+}
+
+static char *
+raidx_contribution_buffer(struct bdev_context_t *bdev_context, uint8_t target_pos)
+{
+    switch (target_pos) {
+        case 0:
+            return bdev_context->buff1;
+        case 1:
+            return bdev_context->buff3;
+        case 2:
+            return bdev_context->buff4;
+        case 3:
+            return bdev_context->buff5;
+        default:
+            SPDK_ERRLOG("Illegal target position: %u\n", target_pos);
+            assert(false);
+    }
+}
+
+static void
+raidx_apply_recon_coeff(struct bdev_context_t *bdev_context, const struct cs_message_t *cs_msg)
+{
+    uint8_t coeff = cs_msg->recon_coeff;
+    uint64_t offset = (cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift;
+    uint64_t length = cs_msg->fwd_length << bdev_context->blk_size_shift;
+
+    if (length == 0 || coeff == 1) {
+        return;
+    }
+
+    if (coeff == 0) {
+        std::memset(bdev_context->buff1 + offset, 0, length);
+        return;
+    }
+
+    gf_vect_mul(length, g_raidx_gf_tbl[coeff],
+                bdev_context->buff1 + offset, bdev_context->buff2 + offset);
+    std::memcpy(bdev_context->buff1 + offset, bdev_context->buff2 + offset, length);
+}
+
+static void
+raidx_try_complete_partial_write(struct recv_wr_wrapper_server *recv_wrapper)
+{
+    struct bdev_context_t *bdev_context = recv_wrapper->bdev_context;
+    struct rdma_qp_server *rqp;
+    struct send_wr_wrapper_server *send_wrapper;
+
+    if (!bdev_context->host_resp_sent &&
+        bdev_context->io_done &&
+        bdev_context->pending_send_completions == 0) {
+        rqp = recv_wrapper->rqp;
+        send_wrapper = TAILQ_FIRST(&rqp->free_send);
+        if (spdk_unlikely(send_wrapper == NULL)) {
+            SPDK_ERRLOG("run out of send buffers\n");
+            assert(false);
+        }
+        TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
+        send_wrapper->ctx = NULL;
+        send_wrapper->await_callback = false;
+        rdma_send_resp(send_wrapper, recv_wrapper->cs_msg->req_id);
+        bdev_context->host_resp_sent = true;
+    }
+
+    if (bdev_context->host_resp_sent && bdev_context->pending_peer_callbacks == 0) {
+        bdev_context->state = RELEASE;
+        rdma_recv(recv_wrapper);
+    }
+}
+
 struct bdev_context_t*
 allocate_bdev_context(void)
 {
@@ -71,6 +197,30 @@ allocate_bdev_context(void)
         free(tmp);
         return NULL;
     }
+    tmp->buff3 = (char*) spdk_dma_zmalloc(g_strip_size * g_bdev_context->blk_size, g_bdev_context->buf_align, NULL);
+    if (!tmp->buff3) {
+        spdk_dma_free(tmp->buff1);
+        spdk_dma_free(tmp->buff2);
+        free(tmp);
+        return NULL;
+    }
+    tmp->buff4 = (char*) spdk_dma_zmalloc(g_strip_size * g_bdev_context->blk_size, g_bdev_context->buf_align, NULL);
+    if (!tmp->buff4) {
+        spdk_dma_free(tmp->buff1);
+        spdk_dma_free(tmp->buff2);
+        spdk_dma_free(tmp->buff3);
+        free(tmp);
+        return NULL;
+    }
+    tmp->buff5 = (char*) spdk_dma_zmalloc(g_strip_size * g_bdev_context->blk_size, g_bdev_context->buf_align, NULL);
+    if (!tmp->buff5) {
+        spdk_dma_free(tmp->buff1);
+        spdk_dma_free(tmp->buff2);
+        spdk_dma_free(tmp->buff3);
+        spdk_dma_free(tmp->buff4);
+        free(tmp);
+        return NULL;
+    }
     tmp->buff = tmp->buff1;
     return tmp;
 }
@@ -83,6 +233,9 @@ free_bdev_context(struct bdev_context_t* ptr)
     }
     spdk_dma_free(ptr->buff1);
     spdk_dma_free(ptr->buff2);
+    spdk_dma_free(ptr->buff3);
+    spdk_dma_free(ptr->buff4);
+    spdk_dma_free(ptr->buff5);
     free(ptr);
 }
 
@@ -261,50 +414,77 @@ rdma_send_msg(struct send_wr_wrapper_server *send_wrapper, struct recv_wr_wrappe
     struct ibv_sge *sge = send_wr->sg_list;
     struct ibv_mr *mr;
     uint64_t size;
+    uint8_t target_pos = raidx_target_pos(tgt);
+    uint8_t coeff;
+    char *contribution;
+    uint64_t contribution_offset;
+
     switch (recv_cs_msg->type) {
-        case FWD_RO:
-        case FWD_RW:
         case FWD_RW_DIFF:
-        case FWD_MIX:
+            assert(target_pos < recv_cs_msg->target_num);
+            coeff = recv_cs_msg->coeff[target_pos];
+            contribution = raidx_contribution_buffer(bdev_context, target_pos);
+            contribution_offset = (recv_cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift;
+
+            if (coeff != 1) {
+                gf_vect_mul(recv_cs_msg->fwd_length << bdev_context->blk_size_shift,
+                            g_raidx_gf_tbl[coeff],
+                            bdev_context->buff1 + contribution_offset,
+                            contribution + contribution_offset);
+            }
+
             size = sizeof(cs_message_t) - sizeof(struct sg_entry) * 31;
+            cs_msg_init(cs_msg);
             cs_msg->type = SD_DF;
             cs_msg->length = recv_cs_msg->fwd_length;
             cs_msg->offset = recv_cs_msg->fwd_offset;
+            cs_msg->data_index = recv_cs_msg->data_index;
+            cs_msg->recon_coeff = 1;
             cs_msg->last_index = g_process_id;
             cs_msg->num_sge[0] = 1;
             cs_msg->num_sge[1] = 0;
-            cs_msg->sgl[0].addr = (uint64_t) bdev_context->buff1 + ((cs_msg->offset % g_strip_size) << bdev_context->blk_size_shift);
+            cs_msg->parity_num = 1;
+            cs_msg->coeff_num = 1;
+            cs_msg->parity_row[0] = recv_cs_msg->parity_row[target_pos];
+            cs_msg->coeff[0] = coeff;
+            cs_msg->sgl[0].addr = (uint64_t)((coeff == 1 ? bdev_context->buff1 : contribution) + contribution_offset);
             cs_msg->sgl[0].len = (uint32_t) cs_msg->length << bdev_context->blk_size_shift;
             mr = (struct ibv_mr *) spdk_mem_map_translate(rqp->mem_map, cs_msg->sgl[0].addr, NULL);
             cs_msg->sgl[0].rkey = mr->rkey;
             cs_msg->req_id = (uint64_t) send_wrapper;
             sge->length = size;
             send_wr->imm_data = kReqTypePeer;
-            send_wr->send_flags = 0;
+            send_wr->send_flags = IBV_SEND_SIGNALED;
             break;
         case RECON_NRT:
         case RECON_RT:
+        case RECON_RW_DIFF:
+            contribution_offset = (recv_cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift;
             size = sizeof(cs_message_t) - sizeof(struct sg_entry) * 31;
+            cs_msg_init(cs_msg);
             cs_msg->type = SD_RC;
             cs_msg->length = recv_cs_msg->fwd_length;
             cs_msg->offset = recv_cs_msg->fwd_offset;
+            cs_msg->data_index = recv_cs_msg->data_index;
+            cs_msg->recon_coeff = 1;
             cs_msg->last_index = g_process_id;
             cs_msg->num_sge[0] = 1;
             cs_msg->num_sge[1] = 0;
-            cs_msg->sgl[0].addr = (uint64_t) bdev_context->buff1 + ((cs_msg->offset % g_strip_size) << bdev_context->blk_size_shift);
-            cs_msg->sgl[0].len = (uint32_t) cs_msg->length << bdev_context->blk_size_shift;
-            mr = (struct ibv_mr *) spdk_mem_map_translate(rqp->mem_map, cs_msg->sgl[0].addr, NULL);
+            cs_msg->sgl[0].addr = (uint64_t)bdev_context->buff1 + contribution_offset;
+            cs_msg->sgl[0].len = (uint32_t)cs_msg->length << bdev_context->blk_size_shift;
+            mr = (struct ibv_mr *)spdk_mem_map_translate(rqp->mem_map, cs_msg->sgl[0].addr, NULL);
             cs_msg->sgl[0].rkey = mr->rkey;
-            cs_msg->req_id = (uint64_t) send_wrapper;
+            cs_msg->req_id = (uint64_t)send_wrapper;
             sge->length = size;
             send_wr->imm_data = kReqTypePeer;
-            send_wr->send_flags = 0;
+            send_wr->send_flags = recv_cs_msg->type == RECON_RW_DIFF ? IBV_SEND_SIGNALED : 0;
             break;
         default:
             SPDK_ERRLOG("Illegal message type: %d\n", recv_cs_msg->type);
             assert(false);
     }
 
+    send_wrapper->await_callback = true;
     send_wr->next = NULL;
     if (rqp->send_wrs.first == NULL) {
         rqp->send_wrs.first = send_wr;
@@ -320,6 +500,7 @@ void
 rdma_send_resp(struct send_wr_wrapper_server *send_wrapper, uint64_t req_id)
 {
     struct rdma_qp_server *rqp = send_wrapper->rqp;
+    send_wrapper->await_callback = false;
     send_wrapper->cs_resp->req_id = req_id;
     struct ibv_send_wr *send_wr = &send_wrapper->send_wr;
     struct ibv_sge *sge = send_wr->sg_list;
@@ -379,6 +560,111 @@ map_ibv_send_wr(struct ibv_send_wr *send_wrs, struct sg_entry *sges, uint8_t sge
         laddr_iter += send_len;
         llen -= send_len;
     }
+}
+
+static void
+raidx_start_recon_delta_read(struct recv_wr_wrapper_server *recv_wrapper)
+{
+    struct bdev_context_t *bdev_context = recv_wrapper->bdev_context;
+    struct rdma_qp_server *rqp = recv_wrapper->rqp;
+    uint64_t offset = (recv_wrapper->cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift;
+    uint64_t length = recv_wrapper->cs_msg->fwd_length << bdev_context->blk_size_shift;
+
+    assert(recv_wrapper->cs_msg->num_sge[0] > 0);
+    bdev_context->state = RECON_DIFF_READ_DONE;
+    bdev_context->buff = bdev_context->buff2;
+    map_ibv_send_wr(recv_wrapper->send_wr_read, recv_wrapper->cs_msg->sgl,
+                    recv_wrapper->cs_msg->num_sge[0],
+                    (uint64_t)bdev_context->buff2 + offset, length, rqp, true);
+    rdma_read(recv_wrapper, recv_wrapper->cs_msg->num_sge[0]);
+}
+
+static void
+raidx_apply_local_parity_delta(struct recv_wr_wrapper_server *recv_wrapper, uint8_t target_pos)
+{
+    struct bdev_context_t *bdev_context = recv_wrapper->bdev_context;
+    struct cs_message_t *cs_msg = recv_wrapper->cs_msg;
+    struct recv_wr_wrapper_server *parity_wrapper = nullptr;
+    struct bdev_context_t *parity_context;
+    uint64_t parity_offset = (cs_msg->y_offset % g_strip_size) << bdev_context->blk_size_shift;
+    uint64_t parity_length = cs_msg->y_length << bdev_context->blk_size_shift;
+    uint8_t coeff = cs_msg->coeff[target_pos];
+    char *contribution = bdev_context->buff1;
+    int rc;
+
+    rc = rte_hash_lookup_data(g_req_hash, &cs_msg->y_offset, (void **)&parity_wrapper);
+    if (spdk_unlikely(rc == -ENOENT)) {
+        SPDK_ERRLOG("local parity target is not ready\n");
+        assert(false);
+    } else if (spdk_unlikely(rc < 0)) {
+        assert(false);
+    }
+
+    if (coeff != 1) {
+        contribution = raidx_contribution_buffer(bdev_context, target_pos);
+        gf_vect_mul(parity_length, g_raidx_gf_tbl[coeff],
+                    bdev_context->buff1 + parity_offset,
+                    contribution + parity_offset);
+    }
+
+    parity_context = parity_wrapper->bdev_context;
+    parity_context->recv_cnt++;
+    raid5_xor_buf(parity_context->buff1 + parity_offset,
+                  contribution + parity_offset, parity_length);
+    if (parity_context->recv_cnt == parity_wrapper->cs_msg->fwd_num) {
+        rc = rte_hash_del_key(g_req_hash, &cs_msg->y_offset);
+        if (spdk_unlikely(rc < 0)) {
+            assert(false);
+        }
+        bdev_write((void *)parity_wrapper);
+    }
+}
+
+static void
+raidx_finish_recon_request(struct recv_wr_wrapper_server *recv_wrapper)
+{
+    struct bdev_context_t *bdev_context = recv_wrapper->bdev_context;
+    struct rdma_qp_server *rqp;
+    struct send_wr_wrapper_server *send_wrapper;
+    int8_t next_index = recv_wrapper->cs_msg->type == RECON_RW_DIFF ?
+                        recv_wrapper->cs_msg->recon_next_index :
+                        recv_wrapper->cs_msg->next_index;
+
+    if (next_index < 0) {
+        if (recv_wrapper->cs_msg->type == RECON_RW_DIFF) {
+            raidx_start_recon_delta_read(recv_wrapper);
+            return;
+        }
+
+        rqp = recv_wrapper->rqp;
+        send_wrapper = TAILQ_FIRST(&rqp->free_send);
+        if (spdk_unlikely(send_wrapper == NULL)) {
+            SPDK_ERRLOG("run out of send buffers\n");
+            assert(false);
+        }
+        TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
+        send_wrapper->ctx = recv_wrapper;
+        map_ibv_send_wr(send_wrapper->send_wr_write,
+                        &recv_wrapper->cs_msg->sgl[recv_wrapper->cs_msg->num_sge[0]],
+                        recv_wrapper->cs_msg->num_sge[1],
+                        (uint64_t)bdev_context->buff1 +
+                        ((recv_wrapper->cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift),
+                        recv_wrapper->cs_msg->fwd_length << bdev_context->blk_size_shift,
+                        rqp, false);
+        rdma_write(send_wrapper, recv_wrapper->cs_msg->num_sge[1]);
+        rdma_send_resp(send_wrapper, recv_wrapper->cs_msg->req_id);
+        return;
+    }
+
+    rqp = &g_server_qp_list[next_index];
+    send_wrapper = TAILQ_FIRST(&rqp->free_send);
+    if (spdk_unlikely(send_wrapper == NULL)) {
+        SPDK_ERRLOG("run out of send buffers\n");
+        assert(false);
+    }
+    TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
+    send_wrapper->ctx = recv_wrapper;
+    rdma_send_msg(send_wrapper, recv_wrapper, PEER1);
 }
 
 void
@@ -534,44 +820,30 @@ run_state_machine(struct recv_wr_wrapper_server *recv_wrapper, enum action act)
                           bdev_context->buff2 + ((bdev_context->offset % g_strip_size) << bdev_context->blk_size_shift),
                           bdev_context->size << bdev_context->blk_size_shift);
             bdev_context->buff = bdev_context->buff2;
-            rqp = &g_server_qp_list[recv_wrapper->cs_msg->next_index];
-            send_wrapper = TAILQ_FIRST(&rqp->free_send);
-            if (spdk_unlikely(send_wrapper == NULL)) {
-                SPDK_ERRLOG("run out of send buffers\n");
-                assert(false);
+            for (uint8_t peer_idx = 0; peer_idx < recv_wrapper->cs_msg->target_num; ++peer_idx) {
+                rqp = &g_server_qp_list[(uint8_t)recv_wrapper->cs_msg->target_index[peer_idx]];
+                send_wrapper = TAILQ_FIRST(&rqp->free_send);
+                if (spdk_unlikely(send_wrapper == NULL)) {
+                    SPDK_ERRLOG("run out of send buffers\n");
+                    assert(false);
+                }
+                TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
+                send_wrapper->ctx = recv_wrapper;
+                rdma_send_msg(send_wrapper, recv_wrapper, (enum target)(PEER1 + peer_idx));
             }
-            TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
-            send_wrapper->ctx = recv_wrapper;
-            rdma_send_msg(send_wrapper, recv_wrapper, PEER1);
             bdev_write((void*) recv_wrapper);
             break;
         case FW_DF_PEND2:
-            bdev_context->state = FW_DF_PEND3;
             if (act == IO_COMPLETE) {
-                rqp = recv_wrapper->rqp;
-                send_wrapper = TAILQ_FIRST(&rqp->free_send);
-                if (spdk_unlikely(send_wrapper == NULL)) {
-                    SPDK_ERRLOG("run out of send buffers\n");
-                    assert(false);
-                }
-                TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
-                send_wrapper->ctx = recv_wrapper;
-                rdma_send_resp(send_wrapper, recv_wrapper->cs_msg->req_id);
+                bdev_context->io_done = true;
+            } else if (act == RDMA_SEND_COMPLETE) {
+                assert(bdev_context->pending_send_completions > 0);
+                bdev_context->pending_send_completions--;
+            } else if (act == CALLBACK) {
+                assert(bdev_context->pending_peer_callbacks > 0);
+                bdev_context->pending_peer_callbacks--;
             }
-            break;
-        case FW_DF_PEND3:
-            bdev_context->state = RELEASE;
-            if (act == IO_COMPLETE) {
-                rqp = recv_wrapper->rqp;
-                send_wrapper = TAILQ_FIRST(&rqp->free_send);
-                if (spdk_unlikely(send_wrapper == NULL)) {
-                    SPDK_ERRLOG("run out of send buffers\n");
-                    assert(false);
-                }
-                TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
-                send_wrapper->ctx = recv_wrapper;
-                rdma_send_resp(send_wrapper, recv_wrapper->cs_msg->req_id);
-            }
+            raidx_try_complete_partial_write(recv_wrapper);
             break;
         case FW_MIX_START:
             bdev_context->state = FW_MIX_PEND1;
@@ -761,69 +1033,38 @@ run_state_machine(struct recv_wr_wrapper_server *recv_wrapper, enum action act)
             break;
         case RECON_IO_DONE:
             bdev_context->state = RELEASE;
+            raidx_apply_recon_coeff(bdev_context, recv_wrapper->cs_msg);
             if (recv_wrapper->cs_msg->fwd_num == 0) {
-                rqp = &g_server_qp_list[recv_wrapper->cs_msg->next_index];
-                send_wrapper = TAILQ_FIRST(&rqp->free_send);
-                if (spdk_unlikely(send_wrapper == NULL)) {
-                    SPDK_ERRLOG("run out of send buffers\n");
-                    assert(false);
-                }
-                TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
-                send_wrapper->ctx = recv_wrapper;
-                rdma_send_msg(send_wrapper, recv_wrapper, PEER1);
+                raidx_finish_recon_request(recv_wrapper);
                 break;
             }
-            rc = rte_hash_lookup_data(g_rc_hash, &recv_wrapper->cs_msg->fwd_offset, (void **) &recv_wrapper_in_map);
+
+            rc = raidx_rc_hash_lookup(recv_wrapper->cs_msg->fwd_offset, recv_wrapper->cs_msg->data_index,
+                                      (void **)&recv_wrapper_in_map);
             if (rc == -ENOENT) {
-                rc = rte_hash_add_key_data(g_rc_hash, &recv_wrapper->cs_msg->fwd_offset, recv_wrapper);
+                rc = raidx_rc_hash_add(recv_wrapper->cs_msg->fwd_offset, recv_wrapper->cs_msg->data_index,
+                                       recv_wrapper);
                 if (spdk_unlikely(rc < 0)) {
                     assert(false);
                 }
                 bdev_context->recv_cnt = 0;
             } else {
                 bdev_context->recv_cnt = recv_wrapper_in_map->bdev_context->recv_cnt;
-                raid5_xor_buf(bdev_context->buff1 + ((recv_wrapper->cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift),
-                              recv_wrapper_in_map->bdev_context->buff1 + ((recv_wrapper->cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift),
+                raid5_xor_buf(bdev_context->buff1 +
+                              ((recv_wrapper->cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift),
+                              recv_wrapper_in_map->bdev_context->buff1 +
+                              ((recv_wrapper->cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift),
                               recv_wrapper->cs_msg->fwd_length << bdev_context->blk_size_shift);
                 rdma_recv(recv_wrapper_in_map);
                 if (bdev_context->recv_cnt == recv_wrapper->cs_msg->fwd_num) {
-                    rc = rte_hash_del_key(g_rc_hash, &recv_wrapper->cs_msg->fwd_offset);
+                    rc = raidx_rc_hash_del(recv_wrapper->cs_msg->fwd_offset, recv_wrapper->cs_msg->data_index);
                     if (spdk_unlikely(rc < 0)) {
                         assert(false);
                     }
-                    if (recv_wrapper->cs_msg->next_index < 0) {
-                        rqp = recv_wrapper->rqp;
-                        send_wrapper = TAILQ_FIRST(&rqp->free_send);
-                        if (spdk_unlikely(send_wrapper == NULL)) {
-                            SPDK_ERRLOG("run out of send buffers\n");
-                            assert(false);
-                        }
-                        TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
-                        send_wrapper->ctx = recv_wrapper;
-                        map_ibv_send_wr(send_wrapper->send_wr_write, &recv_wrapper->cs_msg->sgl[recv_wrapper->cs_msg->num_sge[0]], recv_wrapper->cs_msg->num_sge[1],
-                                        (uint64_t) bdev_context->buff1 + ((recv_wrapper->cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift),
-                                        recv_wrapper->cs_msg->fwd_length << bdev_context->blk_size_shift, rqp, false);
-                        rdma_write(send_wrapper, recv_wrapper->cs_msg->num_sge[1]);
-                        if (bdev_context->offset == 1) {
-                            SPDK_NOTICELOG("recon data 1\n");
-                            show_buffer((unsigned char *) bdev_context->buff1 +
-                                        ((bdev_context->offset % g_strip_size) << bdev_context->blk_size_shift),
-                                        bdev_context->size << bdev_context->blk_size_shift);
-                        }
-                        rdma_send_resp(send_wrapper, recv_wrapper->cs_msg->req_id);
-                    } else {
-                        rqp = &g_server_qp_list[recv_wrapper->cs_msg->next_index];
-                        send_wrapper = TAILQ_FIRST(&rqp->free_send);
-                        if (spdk_unlikely(send_wrapper == NULL)) {
-                            SPDK_ERRLOG("run out of send buffers\n");
-                            assert(false);
-                        }
-                        TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
-                        send_wrapper->ctx = recv_wrapper;
-                        rdma_send_msg(send_wrapper, recv_wrapper, PEER1);
-                    }
+                    raidx_finish_recon_request(recv_wrapper);
                 } else {
-                    rc = rte_hash_add_key_data(g_rc_hash, &recv_wrapper->cs_msg->fwd_offset, recv_wrapper);
+                    rc = raidx_rc_hash_add(recv_wrapper->cs_msg->fwd_offset, recv_wrapper->cs_msg->data_index,
+                                           recv_wrapper);
                     if (spdk_unlikely(rc < 0)) {
                         assert(false);
                     }
@@ -839,8 +1080,10 @@ run_state_machine(struct recv_wr_wrapper_server *recv_wrapper, enum action act)
             bdev_context->state = RECON_READ_PEND;
             if (recv_wrapper->cs_msg->fwd_num > 0) {
                 bdev_context->buff = bdev_context->buff2;
-                std::memcpy(bdev_context->buff2 + ((recv_wrapper->cs_msg->offset % g_strip_size) << bdev_context->blk_size_shift),
-                            bdev_context->buff1 + ((recv_wrapper->cs_msg->offset % g_strip_size) << bdev_context->blk_size_shift),
+                std::memcpy(bdev_context->buff2 +
+                            ((recv_wrapper->cs_msg->offset % g_strip_size) << bdev_context->blk_size_shift),
+                            bdev_context->buff1 +
+                            ((recv_wrapper->cs_msg->offset % g_strip_size) << bdev_context->blk_size_shift),
                             recv_wrapper->cs_msg->length << bdev_context->blk_size_shift);
             }
             rqp = recv_wrapper->rqp;
@@ -851,69 +1094,46 @@ run_state_machine(struct recv_wr_wrapper_server *recv_wrapper, enum action act)
             }
             TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
             send_wrapper->ctx = recv_wrapper;
-            map_ibv_send_wr(send_wrapper->send_wr_write, recv_wrapper->cs_msg->sgl, recv_wrapper->cs_msg->num_sge[0],
-                            (uint64_t) bdev_context->buff + ((recv_wrapper->cs_msg->offset % g_strip_size) << bdev_context->blk_size_shift),
+            map_ibv_send_wr(send_wrapper->send_wr_write, recv_wrapper->cs_msg->sgl,
+                            recv_wrapper->cs_msg->num_sge[0],
+                            (uint64_t)bdev_context->buff +
+                            ((recv_wrapper->cs_msg->offset % g_strip_size) << bdev_context->blk_size_shift),
                             recv_wrapper->cs_msg->length << bdev_context->blk_size_shift, rqp, false);
             rdma_write(send_wrapper, recv_wrapper->cs_msg->num_sge[0]);
             rdma_send_resp(send_wrapper, recv_wrapper->cs_msg->req_id);
 
+            raidx_apply_recon_coeff(bdev_context, recv_wrapper->cs_msg);
             if (recv_wrapper->cs_msg->fwd_num == 0) {
-                rqp = &g_server_qp_list[recv_wrapper->cs_msg->next_index];
-                send_wrapper = TAILQ_FIRST(&rqp->free_send);
-                if (spdk_unlikely(send_wrapper == NULL)) {
-                    SPDK_ERRLOG("run out of send buffers\n");
-                    assert(false);
-                }
-                TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
-                send_wrapper->ctx = recv_wrapper;
-                rdma_send_msg(send_wrapper, recv_wrapper, PEER1);
+                raidx_finish_recon_request(recv_wrapper);
                 break;
             }
-            rc = rte_hash_lookup_data(g_rc_hash, &recv_wrapper->cs_msg->fwd_offset, (void **) &recv_wrapper_in_map);
+
+            rc = raidx_rc_hash_lookup(recv_wrapper->cs_msg->fwd_offset, recv_wrapper->cs_msg->data_index,
+                                      (void **)&recv_wrapper_in_map);
             if (rc == -ENOENT) {
-                rc = rte_hash_add_key_data(g_rc_hash, &recv_wrapper->cs_msg->fwd_offset, recv_wrapper);
+                rc = raidx_rc_hash_add(recv_wrapper->cs_msg->fwd_offset, recv_wrapper->cs_msg->data_index,
+                                       recv_wrapper);
                 if (spdk_unlikely(rc < 0)) {
                     assert(false);
                 }
                 bdev_context->recv_cnt = 0;
             } else {
                 bdev_context->recv_cnt = recv_wrapper_in_map->bdev_context->recv_cnt;
-                raid5_xor_buf(bdev_context->buff1 + ((recv_wrapper->cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift),
-                              recv_wrapper_in_map->bdev_context->buff1 + ((recv_wrapper->cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift),
+                raid5_xor_buf(bdev_context->buff1 +
+                              ((recv_wrapper->cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift),
+                              recv_wrapper_in_map->bdev_context->buff1 +
+                              ((recv_wrapper->cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift),
                               recv_wrapper->cs_msg->fwd_length << bdev_context->blk_size_shift);
                 rdma_recv(recv_wrapper_in_map);
                 if (bdev_context->recv_cnt == recv_wrapper->cs_msg->fwd_num) {
-                    rc = rte_hash_del_key(g_rc_hash, &recv_wrapper->cs_msg->fwd_offset);
+                    rc = raidx_rc_hash_del(recv_wrapper->cs_msg->fwd_offset, recv_wrapper->cs_msg->data_index);
                     if (spdk_unlikely(rc < 0)) {
                         assert(false);
                     }
-                    if (recv_wrapper->cs_msg->next_index < 0) {
-                        rqp = recv_wrapper->rqp;
-                        send_wrapper = TAILQ_FIRST(&rqp->free_send);
-                        if (spdk_unlikely(send_wrapper == NULL)) {
-                            SPDK_ERRLOG("run out of send buffers\n");
-                            assert(false);
-                        }
-                        TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
-                        send_wrapper->ctx = recv_wrapper;
-                        map_ibv_send_wr(send_wrapper->send_wr_write, &recv_wrapper->cs_msg->sgl[recv_wrapper->cs_msg->num_sge[0]], recv_wrapper->cs_msg->num_sge[1],
-                                        (uint64_t) bdev_context->buff1 + ((recv_wrapper->cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift),
-                                        recv_wrapper->cs_msg->fwd_length << bdev_context->blk_size_shift, rqp, false);
-                        rdma_write(send_wrapper, recv_wrapper->cs_msg->num_sge[1]);
-                        rdma_send_resp(send_wrapper, recv_wrapper->cs_msg->req_id);
-                    } else {
-                        rqp = &g_server_qp_list[recv_wrapper->cs_msg->next_index];
-                        send_wrapper = TAILQ_FIRST(&rqp->free_send);
-                        if (spdk_unlikely(send_wrapper == NULL)) {
-                            SPDK_ERRLOG("run out of send buffers\n");
-                            assert(false);
-                        }
-                        TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
-                        send_wrapper->ctx = recv_wrapper;
-                        rdma_send_msg(send_wrapper, recv_wrapper, PEER1);
-                    }
+                    raidx_finish_recon_request(recv_wrapper);
                 } else {
-                    rc = rte_hash_add_key_data(g_rc_hash, &recv_wrapper->cs_msg->fwd_offset, recv_wrapper);
+                    rc = raidx_rc_hash_add(recv_wrapper->cs_msg->fwd_offset, recv_wrapper->cs_msg->data_index,
+                                           recv_wrapper);
                     if (spdk_unlikely(rc < 0)) {
                         assert(false);
                     }
@@ -932,47 +1152,27 @@ run_state_machine(struct recv_wr_wrapper_server *recv_wrapper, enum action act)
             rdma_read(recv_wrapper, recv_wrapper->cs_msg->num_sge[0]);
             break;
         case RECON_DF_READ_DONE:
-            rc = rte_hash_lookup_data(g_rc_hash, &bdev_context->offset, (void **) &recv_wrapper_in_map);
+            rc = raidx_rc_hash_lookup(bdev_context->offset, recv_wrapper->cs_msg->data_index,
+                                      (void **)&recv_wrapper_in_map);
             if (rc == -ENOENT) {
-                rc = rte_hash_add_key_data(g_rc_hash, &bdev_context->offset, recv_wrapper);
+                rc = raidx_rc_hash_add(bdev_context->offset, recv_wrapper->cs_msg->data_index, recv_wrapper);
                 if (spdk_unlikely(rc < 0)) {
                     assert(false);
                 }
                 bdev_context->recv_cnt = 1;
             } else {
                 recv_wrapper_in_map->bdev_context->recv_cnt++;
-                raid5_xor_buf(recv_wrapper_in_map->bdev_context->buff1 + ((bdev_context->offset % g_strip_size) << bdev_context->blk_size_shift),
-                              bdev_context->buff1 + ((bdev_context->offset % g_strip_size) << bdev_context->blk_size_shift),
+                raid5_xor_buf(recv_wrapper_in_map->bdev_context->buff1 +
+                              ((bdev_context->offset % g_strip_size) << bdev_context->blk_size_shift),
+                              bdev_context->buff1 +
+                              ((bdev_context->offset % g_strip_size) << bdev_context->blk_size_shift),
                               bdev_context->size << bdev_context->blk_size_shift);
                 rdma_recv(recv_wrapper);
                 if (recv_wrapper_in_map->bdev_context->recv_cnt == recv_wrapper_in_map->cs_msg->fwd_num &&
-                    (recv_wrapper_in_map->bdev_context->state != RECON_DF_READ_DONE)) {
-                    if (recv_wrapper_in_map->cs_msg->next_index < 0) {
-                        rqp = recv_wrapper_in_map->rqp;
-                        send_wrapper = TAILQ_FIRST(&rqp->free_send);
-                        if (spdk_unlikely(send_wrapper == NULL)) {
-                            SPDK_ERRLOG("run out of send buffers\n");
-                            assert(false);
-                        }
-                        TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
-                        send_wrapper->ctx = recv_wrapper_in_map;
-                        map_ibv_send_wr(send_wrapper->send_wr_write, &recv_wrapper_in_map->cs_msg->sgl[recv_wrapper_in_map->cs_msg->num_sge[0]], recv_wrapper_in_map->cs_msg->num_sge[1],
-                                        (uint64_t) recv_wrapper_in_map->bdev_context->buff1 + ((recv_wrapper_in_map->cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift),
-                                        recv_wrapper_in_map->cs_msg->fwd_length << bdev_context->blk_size_shift, rqp, false);
-                        rdma_write(send_wrapper, recv_wrapper_in_map->cs_msg->num_sge[1]);
-                        rdma_send_resp(send_wrapper, recv_wrapper_in_map->cs_msg->req_id);
-                    } else {
-                        rqp = &g_server_qp_list[recv_wrapper_in_map->cs_msg->next_index];
-                        send_wrapper = TAILQ_FIRST(&rqp->free_send);
-                        if (spdk_unlikely(send_wrapper == NULL)) {
-                            SPDK_ERRLOG("run out of send buffers\n");
-                            assert(false);
-                        }
-                        TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
-                        send_wrapper->ctx = recv_wrapper_in_map;
-                        rdma_send_msg(send_wrapper, recv_wrapper_in_map, PEER1);
-                    }
-                    rc = rte_hash_del_key(g_rc_hash, &recv_wrapper_in_map->cs_msg->fwd_offset);
+                    recv_wrapper_in_map->bdev_context->state != RECON_DF_READ_DONE) {
+                    raidx_finish_recon_request(recv_wrapper_in_map);
+                    rc = raidx_rc_hash_del(recv_wrapper_in_map->cs_msg->fwd_offset,
+                                           recv_wrapper_in_map->cs_msg->data_index);
                     if (spdk_unlikely(rc < 0)) {
                         assert(false);
                     }
@@ -987,6 +1187,57 @@ run_state_machine(struct recv_wr_wrapper_server *recv_wrapper, enum action act)
             TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
             send_wrapper->ctx = NULL;
             rdma_send_resp(send_wrapper, recv_wrapper->cs_msg->req_id);
+            break;
+        case RECON_DIFF_READ_DONE: {
+            uint64_t recon_offset = (recv_wrapper->cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift;
+            uint8_t saved_type = recv_wrapper->cs_msg->type;
+            uint64_t saved_fwd_offset = recv_wrapper->cs_msg->fwd_offset;
+            uint64_t saved_fwd_length = recv_wrapper->cs_msg->fwd_length;
+
+            bdev_context->state = RECON_DIFF_PEND;
+            bdev_context->pending_send_completions = 0;
+            bdev_context->pending_peer_callbacks = 0;
+            bdev_context->io_done = true;
+            bdev_context->host_resp_sent = false;
+            raid5_xor_buf(bdev_context->buff1 + recon_offset,
+                          bdev_context->buff2 + recon_offset,
+                          recv_wrapper->cs_msg->fwd_length << bdev_context->blk_size_shift);
+
+            recv_wrapper->cs_msg->type = FWD_RW_DIFF;
+            recv_wrapper->cs_msg->fwd_offset = recv_wrapper->cs_msg->y_offset;
+            recv_wrapper->cs_msg->fwd_length = recv_wrapper->cs_msg->y_length;
+            for (uint8_t peer_idx = 0; peer_idx < recv_wrapper->cs_msg->target_num; ++peer_idx) {
+                if (recv_wrapper->cs_msg->target_index[peer_idx] == g_process_id) {
+                    raidx_apply_local_parity_delta(recv_wrapper, peer_idx);
+                    continue;
+                }
+                rqp = &g_server_qp_list[(uint8_t)recv_wrapper->cs_msg->target_index[peer_idx]];
+                send_wrapper = TAILQ_FIRST(&rqp->free_send);
+                if (spdk_unlikely(send_wrapper == NULL)) {
+                    SPDK_ERRLOG("run out of send buffers\n");
+                    assert(false);
+                }
+                TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
+                send_wrapper->ctx = recv_wrapper;
+                bdev_context->pending_send_completions++;
+                bdev_context->pending_peer_callbacks++;
+                rdma_send_msg(send_wrapper, recv_wrapper, (enum target)(PEER1 + peer_idx));
+            }
+            recv_wrapper->cs_msg->type = saved_type;
+            recv_wrapper->cs_msg->fwd_offset = saved_fwd_offset;
+            recv_wrapper->cs_msg->fwd_length = saved_fwd_length;
+            raidx_try_complete_partial_write(recv_wrapper);
+            break;
+        }
+        case RECON_DIFF_PEND:
+            if (act == RDMA_SEND_COMPLETE) {
+                assert(bdev_context->pending_send_completions > 0);
+                bdev_context->pending_send_completions--;
+            } else if (act == CALLBACK) {
+                assert(bdev_context->pending_peer_callbacks > 0);
+                bdev_context->pending_peer_callbacks--;
+            }
+            raidx_try_complete_partial_write(recv_wrapper);
             break;
         case RELEASE:
             rdma_recv(recv_wrapper);
@@ -1025,46 +1276,20 @@ req_handler_partial_write(struct recv_wr_wrapper_server *recv_wrapper)
 {
     struct bdev_context_t* bdev_context = recv_wrapper->bdev_context;
     struct cs_message_t *cs_msg = recv_wrapper->cs_msg;
-    uint64_t left_bound, right_bound;
+    uint64_t fwd_offset_bytes;
 
     switch (cs_msg->type) {
-        case FWD_RO:
-            bdev_context->state = FW_RO_START;
-            bdev_context->offset = cs_msg->fwd_offset;
-            bdev_context->size = cs_msg->fwd_length;
-            if (cs_msg->length != cs_msg->fwd_length) {
-                cs_msg->fwd_offset = cs_msg->offset;
-                cs_msg->fwd_length = cs_msg->length;
-                std::memset(bdev_context->buff1, 0, g_strip_size << bdev_context->blk_size_shift);
-            }
-            break;
-        case FWD_RW:
-            bdev_context->state = FW_RW_START;
-            if (cs_msg->length == cs_msg->fwd_length) {
-                bdev_context->size = 0;
-            } else {
-                if (cs_msg->fwd_offset < cs_msg->offset) {
-                    bdev_context->offset = cs_msg->fwd_offset;
-                } else {
-                    bdev_context->offset = cs_msg->offset + cs_msg->length;
-                }
-                bdev_context->size = cs_msg->fwd_length - cs_msg->length;
-            }
-            break;
         case FWD_RW_DIFF:
             bdev_context->state = FW_DF_START;
             bdev_context->offset = cs_msg->offset;
             bdev_context->size = cs_msg->length;
-            std::memset(bdev_context->buff1 + ((cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift),
-                        0, cs_msg->fwd_length << bdev_context->blk_size_shift);
-            break;
-        case FWD_MIX:
-            bdev_context->state = FW_MIX_START;
-            left_bound = spdk_min(cs_msg->fwd_offset, cs_msg->offset);
-            right_bound = spdk_max(cs_msg->fwd_offset + cs_msg->fwd_length, cs_msg->offset + cs_msg->length);
-            bdev_context->offset = left_bound;
-            bdev_context->size = right_bound - left_bound;
-            std::memset(bdev_context->buff1, 0, g_strip_size << bdev_context->blk_size_shift);
+            bdev_context->pending_send_completions = cs_msg->target_num;
+            bdev_context->pending_peer_callbacks = cs_msg->target_num;
+            bdev_context->io_done = false;
+            bdev_context->host_resp_sent = false;
+            fwd_offset_bytes = (cs_msg->fwd_offset % g_strip_size) << bdev_context->blk_size_shift;
+            std::memset(bdev_context->buff1 + fwd_offset_bytes, 0,
+                        cs_msg->fwd_length << bdev_context->blk_size_shift);
             break;
         default:
             SPDK_ERRLOG("Illegal message type: %d\n", cs_msg->type);
@@ -1086,18 +1311,6 @@ req_handler_parity(struct recv_wr_wrapper_server *recv_wrapper)
         case PR_DIFF:
             bdev_context->state = PR_DF_START;
             break;
-        case PR_NO_DIFF:
-            bdev_context->state = PR_IO1_DONE;
-            std::memset(bdev_context->buff1 + ((bdev_context->offset % g_strip_size) << bdev_context->blk_size_shift),
-                        0, bdev_context->size << bdev_context->blk_size_shift);
-            break;
-        case PR_MIX:
-            bdev_context->state = PR_MIX_START;
-            if (cs_msg->fwd_offset <= cs_msg->offset) {
-                bdev_context->offset = cs_msg->fwd_offset + cs_msg->fwd_length;
-            }
-            bdev_context->size = cs_msg->length - cs_msg->fwd_length;
-            break;
         default:
             SPDK_ERRLOG("Illegal message type: %d\n", cs_msg->type);
             assert(false);
@@ -1111,7 +1324,7 @@ req_handler_rcread(struct recv_wr_wrapper_server *recv_wrapper)
     struct bdev_context_t* bdev_context = recv_wrapper->bdev_context;
     struct cs_message_t *cs_msg = recv_wrapper->cs_msg;
 
-    if(need_read(cs_msg->type)) {
+    if (need_read(cs_msg->type)) {
         bdev_context->offset = spdk_min(cs_msg->offset, cs_msg->fwd_offset);
         bdev_context->size = spdk_max(cs_msg->offset + cs_msg->length, cs_msg->fwd_offset + cs_msg->fwd_length)
                              - bdev_context->offset;
@@ -1120,6 +1333,14 @@ req_handler_rcread(struct recv_wr_wrapper_server *recv_wrapper)
         bdev_context->offset = cs_msg->fwd_offset;
         bdev_context->size = cs_msg->fwd_length;
         bdev_context->state = RECON_START;
+    }
+
+    if (cs_msg->type == RECON_RW_DIFF && cs_msg->recon_next_index < 0) {
+        uint64_t parity_offset = (cs_msg->y_offset % g_strip_size) << bdev_context->blk_size_shift;
+        uint64_t parity_length = cs_msg->y_length << bdev_context->blk_size_shift;
+
+        std::memset(bdev_context->buff1 + parity_offset, 0, parity_length);
+        std::memset(bdev_context->buff2 + parity_offset, 0, parity_length);
     }
 
     run_state_machine(recv_wrapper, INIT);
@@ -1153,7 +1374,10 @@ req_handler_callback(struct recv_wr_wrapper_server *recv_wrapper)
     struct cs_resp_t *cs_resp = recv_wrapper->cs_resp;
     struct send_wr_wrapper_server *send_wrapper_release = (struct send_wr_wrapper_server *) cs_resp->req_id;
     struct recv_wr_wrapper_server *recv_wrapper_release = send_wrapper_release->ctx;
-    run_state_machine(recv_wrapper_release,CALLBACK);
+    send_wrapper_release->await_callback = false;
+    if (recv_wrapper_release != NULL) {
+        run_state_machine(recv_wrapper_release, CALLBACK);
+    }
     TAILQ_INSERT_TAIL(&send_wrapper_release->rqp->free_send, send_wrapper_release, link);
     rdma_recv(recv_wrapper);
 }
@@ -1184,9 +1408,14 @@ poll_cq(void *arg)
             case IBV_WC_SEND:
                 send_wrapper = (struct send_wr_wrapper_server *) id;
                 if (send_wrapper->ctx != NULL) {
-                    run_state_machine(send_wrapper->ctx, RDMA_SEND_COMPLETE);
+                    if (!(send_wrapper->await_callback &&
+                          send_wrapper->ctx->bdev_context->state == RELEASE)) {
+                        run_state_machine(send_wrapper->ctx, RDMA_SEND_COMPLETE);
+                    }
                 }
-                TAILQ_INSERT_TAIL(&send_wrapper->rqp->free_send, send_wrapper, link);
+                if (!send_wrapper->await_callback) {
+                    TAILQ_INSERT_TAIL(&send_wrapper->rqp->free_send, send_wrapper, link);
+                }
                 break;
             case IBV_WC_RDMA_READ:
                 recv_wrapper = (struct recv_wr_wrapper_server *) id;
@@ -1228,50 +1457,58 @@ poll_cq(void *arg)
     for (i = 0; i < g_num_qp; i++) {
         rqp = &g_host_qp_list[i];
 
-        if (spdk_unlikely(ibv_post_send(rqp->cmd_cm_id->qp, rqp->send_wrs.first, &bad_send_wr))) {
-            SPDK_ERRLOG("post send failed\n");
-            assert(false);
+        if (rqp->send_wrs.first != NULL) {
+            if (spdk_unlikely(ibv_post_send(rqp->cmd_cm_id->qp, rqp->send_wrs.first, &bad_send_wr))) {
+                SPDK_ERRLOG("post send failed\n");
+                assert(false);
+            }
+            num_cqe += rqp->send_wrs.size;
+            rqp->send_wrs.first = NULL;
+            rqp->send_wrs.size = 0;
         }
-        num_cqe += rqp->send_wrs.size;
-        rqp->send_wrs.first = NULL;
-        rqp->send_wrs.size = 0;
-        if (spdk_unlikely(ibv_post_recv(rqp->cmd_cm_id->qp, rqp->recv_wrs.first, &bad_recv_wr))) {
-            SPDK_ERRLOG("post recv failed\n");
-            assert(false);
+        if (rqp->recv_wrs.first != NULL) {
+            if (spdk_unlikely(ibv_post_recv(rqp->cmd_cm_id->qp, rqp->recv_wrs.first, &bad_recv_wr))) {
+                SPDK_ERRLOG("post recv failed\n");
+                assert(false);
+            }
+            num_cqe += rqp->recv_wrs.size;
+            rqp->recv_wrs.first = NULL;
+            rqp->recv_wrs.size = 0;
         }
-        num_cqe += rqp->recv_wrs.size;
-        rqp->recv_wrs.first = NULL;
-        rqp->recv_wrs.size = 0;
     }
     for (i = 0; i < g_numOfServers; i++) {
         if (i == g_process_id) {
             continue;
         }
         rqp = &g_server_qp_list[i];
-        ret = ibv_post_send(rqp->cmd_cm_id->qp, rqp->send_wrs.first, &bad_send_wr);
-        if (spdk_unlikely(ret)) {
-            SPDK_ERRLOG("post send failed\n");
-            if (ret == EINVAL || ret == -EINVAL) {
-                SPDK_ERRLOG("EINVAL\n");
-            } else if (ret == ENOMEM || ret == -ENOMEM){
-                SPDK_ERRLOG("ENOMEM\n");
-            } else if (ret == EFAULT || ret == -EFAULT) {
-                SPDK_ERRLOG("EFAULT\n");
-            } else {
-                SPDK_ERRLOG("ret=%d, errno=%d\n", ret, errno);
+        if (rqp->send_wrs.first != NULL) {
+            ret = ibv_post_send(rqp->cmd_cm_id->qp, rqp->send_wrs.first, &bad_send_wr);
+            if (spdk_unlikely(ret)) {
+                SPDK_ERRLOG("post send failed\n");
+                if (ret == EINVAL || ret == -EINVAL) {
+                    SPDK_ERRLOG("EINVAL\n");
+                } else if (ret == ENOMEM || ret == -ENOMEM){
+                    SPDK_ERRLOG("ENOMEM\n");
+                } else if (ret == EFAULT || ret == -EFAULT) {
+                    SPDK_ERRLOG("EFAULT\n");
+                } else {
+                    SPDK_ERRLOG("ret=%d, errno=%d\n", ret, errno);
+                }
+                assert(false);
             }
-            assert(false);
+            num_cqe += rqp->send_wrs.size;
+            rqp->send_wrs.first = NULL;
+            rqp->send_wrs.size = 0;
         }
-        num_cqe += rqp->send_wrs.size;
-        rqp->send_wrs.first = NULL;
-        rqp->send_wrs.size = 0;
-        if (spdk_unlikely(ibv_post_recv(rqp->cmd_cm_id->qp, rqp->recv_wrs.first, &bad_recv_wr))) {
-            SPDK_ERRLOG("post recv failed\n");
-            assert(false);
+        if (rqp->recv_wrs.first != NULL) {
+            if (spdk_unlikely(ibv_post_recv(rqp->cmd_cm_id->qp, rqp->recv_wrs.first, &bad_recv_wr))) {
+                SPDK_ERRLOG("post recv failed\n");
+                assert(false);
+            }
+            num_cqe += rqp->recv_wrs.size;
+            rqp->recv_wrs.first = NULL;
+            rqp->recv_wrs.size = 0;
         }
-        num_cqe += rqp->recv_wrs.size;
-        rqp->recv_wrs.first = NULL;
-        rqp->recv_wrs.size = 0;
     }
 
     return num_cqe > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
@@ -1577,11 +1814,7 @@ connect_rdma_connections(void)
         // 首次 bind 后，从 cm_id->verbs 获取实际选中的 RDMA 设备，创建全局 CQ
         // 避免 contexts[] 硬编码索引导致设备错配（如 192.168.1.x 返回 contexts[1] 而非 contexts[0]）
         if (g_cq == NULL) {
-            g_cq = ibv_create_cq(host_cmd_cm_id_list[i]->verbs,
-                                 server_cq_entries(),
-                                 NULL,
-                                 NULL,
-                                 0);
+            g_cq = ibv_create_cq(host_cmd_cm_id_list[i]->verbs, paraSend * g_num_qp * 2, NULL, NULL, 0);
             assert(g_cq != NULL);
         }
         ret = rdma_listen(host_cmd_cm_id_list[i], 10);
@@ -1634,9 +1867,9 @@ connect_rdma_connections(void)
         svr_cmd_pd_list[i] = svr_cmd_cm_id_list[i]->pd;
         g_server_qp_list[i].cmd_cm_id = svr_cmd_cm_id_list[i];
 
-        qp_attr.cap.max_send_wr = peer_qp_send_wr_budget();
+        qp_attr.cap.max_send_wr = paraSend * g_num_qp;
         qp_attr.cap.max_send_sge = 1;
-        qp_attr.cap.max_recv_wr = peer_qp_recv_wr_budget();
+        qp_attr.cap.max_recv_wr = paraSend * g_num_qp;
         qp_attr.cap.max_recv_sge = 1;
         qp_attr.send_cq = g_cq;
         qp_attr.recv_cq = g_cq;
@@ -1717,9 +1950,9 @@ connect_rdma_connections(void)
 
         svr_cmd_pd_list[i] = g_server_qp_list[i].cmd_cm_id->pd;
 
-        qp_attr.cap.max_send_wr = peer_qp_send_wr_budget();
+        qp_attr.cap.max_send_wr = paraSend * g_num_qp;
         qp_attr.cap.max_send_sge = 1;
-        qp_attr.cap.max_recv_wr = peer_qp_recv_wr_budget();
+        qp_attr.cap.max_recv_wr = paraSend * g_num_qp;
         qp_attr.cap.max_recv_sge = 1;
         qp_attr.send_cq = g_cq;
         qp_attr.recv_cq = g_cq;
@@ -1811,7 +2044,7 @@ connect_rdma_connections(void)
 
         host_cmd_pd_list[i] = g_host_qp_list[i].cmd_cm_id->pd;
 
-        qp_attr.cap.max_send_wr = host_qp_send_wr_budget();
+        qp_attr.cap.max_send_wr = spdk_min(paraSend * 17, 4096);
         qp_attr.cap.max_send_sge = 1;
         qp_attr.cap.max_recv_wr = paraSend;
         qp_attr.cap.max_recv_sge = 1;
@@ -1928,13 +2161,18 @@ bdev_start(void *arg1)
     bdev_context->buf_align = spdk_max(spdk_bdev_get_buf_align(bdev_context->bdev), 32);
     g_strip_size = g_strip_size * 1024 / bdev_context->blk_size;
 
-    snprintf(name_buf, sizeof(name_buf), "raid5_hash_req");
+    snprintf(name_buf, sizeof(name_buf), "raidx_hash_req");
     hash_params.name = name_buf;
     g_req_hash = rte_hash_create(&hash_params);
 
-    snprintf(name_buf, sizeof(name_buf), "raid5_hash_rc");
+    snprintf(name_buf, sizeof(name_buf), "raidx_hash_rc");
     hash_params.name = name_buf;
+    hash_params.key_len = sizeof(struct raidx_rc_hash_key);
     g_rc_hash = rte_hash_create(&hash_params);
+
+    for (int coeff = 0; coeff < 256; ++coeff) {
+        gf_vect_mul_init((unsigned char)coeff, g_raidx_gf_tbl[coeff]);
+    }
 
     connect_rdma_connections();
     g_poller = SPDK_POLLER_REGISTER(poll_cq, NULL, 0);
@@ -1989,52 +2227,4 @@ main(int argc, char **argv)
     spdk_app_fini();
 
     free(g_bdev_context);
-}
-static int
-host_qp_send_wr_budget()
-{
-    /*
-     * host-facing 路径的一个 slot 最坏会挂 16 个 RDMA READ/WRITE，再加 1 个 SEND 响应。
-     * 原实现已经按这个思路配置过 host QP，这里提成 helper 便于和 peer QP / CQ 统一。
-     */
-    return spdk_min(paraSend * 17, 4096);
-}
-
-static int
-peer_qp_send_wr_budget()
-{
-    /*
-     * peer-server QP 之前只给了 `paraSend * g_num_qp` 个 send WR，默认只有 256。
-     * 但 peer 路径也会复用每个 recv slot 自带的 16 个 RDMA READ WR，再加后续 SEND，
-     * 单 QP 实际 outstanding WR 预算与 host-facing 路径是同一量级。
-     *
-     * 如果这里只保留 256，单线程 4k write 也会在 poll_cq() 重新投递时触发
-     * `ibv_post_send(...)=ENOMEM`。因此把 peer QP 也提升到同样的 send WR 预算。
-     */
-    return spdk_min(paraSend * g_num_qp * 17, 4096);
-}
-
-static int
-peer_qp_recv_wr_budget()
-{
-    return paraSend * g_num_qp;
-}
-
-static int
-server_cq_entries()
-{
-    /*
-     * dRAID 旧实现把 host-facing QP 和 peer-server QP 都挂在同一个全局 CQ 上。
-     * CQ 必须覆盖两类 QP 的 send/recv completion 总和，否则即便 QP 能接收更多 WR，
-     * completion 侧仍然可能先耗尽。
-     */
-    const int host_send_wr = host_qp_send_wr_budget();
-    const int host_recv_wr = paraSend;
-    const int peer_send_wr = peer_qp_send_wr_budget();
-    const int peer_recv_wr = peer_qp_recv_wr_budget();
-    const int peer_qp_count = spdk_max(g_numOfServers - 1, 0);
-
-    const int host_budget = g_num_qp * (host_send_wr + host_recv_wr);
-    const int peer_budget = peer_qp_count * (peer_send_wr + peer_recv_wr);
-    return spdk_max(host_budget + peer_budget, 4096);
 }

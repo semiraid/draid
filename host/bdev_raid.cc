@@ -127,6 +127,8 @@ static struct {
         { "5", RAID5 },
         { "raid6", RAID6 },
         { "6", RAID6 },
+        { "raidx", RAIDX },
+        { "x", RAIDX },
         { }
 };
 
@@ -493,6 +495,9 @@ raid_bdev_dump_info_json(void *ctx, struct spdk_json_write_ctx *w)
     spdk_json_write_named_string(w, "raid_level", raid_bdev_level_to_str(raid_bdev->level));
     spdk_json_write_named_uint32(w, "num_base_rpcs", raid_bdev->num_base_rpcs);
     spdk_json_write_named_uint32(w, "num_base_rpcs_discovered", raid_bdev->num_base_rpcs_discovered);
+    if (raid_bdev->level == RAIDX) {
+        spdk_json_write_named_uint32(w, "num_parities", raid_bdev->num_parities);
+    }
     spdk_json_write_object_end(w);
 
     return 0;
@@ -521,6 +526,9 @@ raid_bdev_write_config_json(struct spdk_bdev *bdev, struct spdk_json_write_ctx *
     spdk_json_write_named_string(w, "name", bdev->name);
     spdk_json_write_named_uint32(w, "strip_size_kb", raid_bdev->strip_size_kb);
     spdk_json_write_named_string(w, "raid_level", raid_bdev_level_to_str(raid_bdev->level));
+    if (raid_bdev->level == RAIDX) {
+        spdk_json_write_named_uint32(w, "num_parities", raid_bdev->num_parities);
+    }
 
     spdk_json_write_named_array_begin(w, "base_rpcs");
     RAID_FOR_EACH_BASE_RPC(raid_bdev, base_info) {
@@ -578,7 +586,7 @@ raid_bdev_config_find_by_name(const char *raid_name)
  */
 int
 raid_bdev_config_add(const char *raid_name, uint32_t strip_size, uint8_t num_qp, uint8_t num_base_rpcs,
-                     enum raid_level level, struct raid_bdev_config **_raid_cfg)
+                     enum raid_level level, uint8_t num_parities, struct raid_bdev_config **_raid_cfg)
 {
     struct raid_bdev_config *raid_cfg;
 
@@ -604,6 +612,12 @@ raid_bdev_config_add(const char *raid_name, uint32_t strip_size, uint8_t num_qp,
         return -EINVAL;
     }
 
+    if (level == RAIDX &&
+        (num_parities == 0 || num_parities > kRaidxMaxParityRows || num_parities >= num_base_rpcs)) {
+        SPDK_ERRLOG("Invalid raidx parity count %u for %u base rpcs\n", num_parities, num_base_rpcs);
+        return -EINVAL;
+    }
+
     raid_cfg = (struct raid_bdev_config*) calloc(1, sizeof(*raid_cfg));
     if (raid_cfg == NULL) {
         SPDK_ERRLOG("unable to allocate memory\n");
@@ -620,6 +634,7 @@ raid_bdev_config_add(const char *raid_name, uint32_t strip_size, uint8_t num_qp,
     raid_cfg->num_qp = num_qp;
     raid_cfg->num_base_rpcs = num_base_rpcs;
     raid_cfg->level = level;
+    raid_cfg->num_parities = num_parities;
 
     raid_cfg->base_rpcs = (struct raid_base_rpc_config*) calloc(num_base_rpcs, sizeof(*raid_cfg->base_rpcs));
     if (raid_cfg->base_rpcs == NULL) {
@@ -1101,7 +1116,18 @@ raid_bdev_create(struct raid_bdev_config *raid_cfg)
     raid_bdev->num_qp = raid_cfg->num_qp;
     raid_bdev->config = raid_cfg;
     raid_bdev->level = raid_cfg->level;
+    raid_bdev->num_parities = raid_cfg->level == RAIDX ? raid_cfg->num_parities : module->base_rpcs_max_degraded;
+    raid_bdev->num_data_chunks = raid_bdev->num_base_rpcs - raid_bdev->num_parities;
     raid_bdev->degraded = false;
+
+    if (raid_bdev->num_parities == 0 || raid_bdev->num_base_rpcs <= raid_bdev->num_parities) {
+        SPDK_ERRLOG("Invalid geometry for raid level '%s': total=%u parity=%u\n",
+                    raid_bdev_level_to_str(raid_cfg->level),
+                    raid_bdev->num_base_rpcs, raid_bdev->num_parities);
+        free(raid_bdev->base_rpc_info);
+        free(raid_bdev);
+        return -EINVAL;
+    }
 
     raid_bdev_gen = &raid_bdev->bdev;
 

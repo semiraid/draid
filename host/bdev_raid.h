@@ -9,7 +9,8 @@
 enum raid_level {
     INVALID_RAID_LEVEL	= -1,
     RAID5			= 5,
-    RAID6           = 6
+    RAID6           = 6,
+    RAIDX           = 7
 };
 
 struct send_wr_wrapper;
@@ -133,6 +134,10 @@ struct raid_bdev {
     /* Raid Level of this raid bdev */
     enum raid_level			level;
 
+    uint8_t             num_parities;
+
+    uint8_t             num_data_chunks;
+
     bool degraded;
 
     struct ibv_cq *cq;
@@ -189,6 +194,8 @@ struct raid_bdev_config {
     /* raid level */
     enum raid_level			level;
 
+    uint8_t             num_parities;
+
     TAILQ_ENTRY(raid_bdev_config)	link;
 };
 
@@ -237,7 +244,7 @@ typedef void (*raid_bdev_destruct_cb)(void *cb_ctx, int rc);
 int raid_bdev_create(struct raid_bdev_config *raid_cfg);
 int raid_bdev_add_base_rpcs(struct raid_bdev_config *raid_cfg);
 int raid_bdev_config_add(const char *raid_name, uint32_t strip_size, uint8_t num_qp, uint8_t num_base_rpcs,
-                         enum raid_level level, struct raid_bdev_config **_raid_cfg);
+                         enum raid_level level, uint8_t num_parities, struct raid_bdev_config **_raid_cfg);
 int raid_bdev_config_add_base_rpc(struct raid_bdev_config *raid_cfg, const char *base_rpc_uri, bool degraded,
                                   uint8_t slot);
 struct raid_bdev_config *raid_bdev_config_find_by_name(const char *raid_name);
@@ -267,9 +274,10 @@ static inline void void_cont_func_rdma(struct send_wr_wrapper *send_wrapper) {
 }
 static inline uint8_t return_count(struct cs_message_t *csm) {
     uint8_t type = csm->type;
-    int8_t next_index = csm->next_index;
+    int8_t next_index = type == RECON_RW_DIFF ? csm->recon_next_index : csm->next_index;
     if ((type == RECON_NRT || type == RECON_NRT_DP || type == RECON_NRT_DP_Q ||
-         type == RECON_NRT_DD || type == RECON_NRT_DD_P || type == RECON_NRT_DD_Q) &&
+         type == RECON_NRT_DD || type == RECON_NRT_DD_P || type == RECON_NRT_DD_Q ||
+         type == RECON_RW_DIFF) &&
         next_index != -1) {
         return 0;
     } else if ((type == RECON_RT || type == RECON_RT_DP || type == RECON_RT_DD) &&
@@ -336,6 +344,26 @@ struct raid_bdev_module {
 
     TAILQ_ENTRY(raid_bdev_module) link;
 };
+
+static inline uint8_t
+raid_bdev_num_parities(const struct raid_bdev *raid_bdev)
+{
+    if (raid_bdev->level == RAIDX) {
+        return raid_bdev->num_parities;
+    }
+
+    return raid_bdev->module->base_rpcs_max_degraded;
+}
+
+static inline uint8_t
+raid_bdev_num_data_chunks(const struct raid_bdev *raid_bdev)
+{
+    if (raid_bdev->level == RAIDX) {
+        return raid_bdev->num_data_chunks;
+    }
+
+    return raid_bdev->num_base_rpcs - raid_bdev->module->base_rpcs_max_degraded;
+}
 
 void raid_bdev_module_list_add(struct raid_bdev_module *raid_module);
 

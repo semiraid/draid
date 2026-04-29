@@ -82,3 +82,4 @@ endmacro()
 # ── Executables: raid5 / raid6 ────────────────────────────────────────────────
 add_raid_server(raid5 raid5.cc)
 add_raid_server(raid6 raid6.cc)
+add_raid_server(raidx raidx.cc)

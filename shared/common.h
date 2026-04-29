@@ -56,6 +56,11 @@
 #define PR_QRO 21
 #define FWD_RW_PRO 22
 #define FWD_RO_PRO 23
+#define RECON_RW_DIFF 24 // reconstructed degraded-data write delta
+
+static constexpr uint8_t kRaidxMaxTargets = 4;
+static constexpr uint8_t kRaidxMaxParityRows = 4;
+static constexpr uint8_t kInvalidMissingIndex = UINT8_MAX;
 
 struct sg_entry {
     uint64_t addr;
@@ -67,23 +72,62 @@ struct cs_message_t {
     uint8_t fwd_num;
     uint8_t type;
     uint8_t data_index;
+    uint8_t target_num;
     uint64_t req_id;
-    int8_t next_index;
-    int8_t next_index2;
+    union {
+        struct {
+            int8_t next_index;
+            int8_t next_index2;
+            int8_t next_index3;
+            int8_t next_index4;
+        };
+        int8_t target_index[kRaidxMaxTargets];
+    };
     uint64_t offset;
     uint64_t length;
     uint64_t fwd_offset;
     uint64_t fwd_length;
     uint64_t y_offset;
     uint64_t y_length;
-    uint8_t x_index;
-    uint8_t y_index;
+    uint8_t missing_num;
+    union {
+        struct {
+            uint8_t x_index;
+            uint8_t y_index;
+            uint8_t z_index;
+            uint8_t w_index;
+        };
+        uint8_t missing_index[kRaidxMaxParityRows];
+    };
+    uint8_t parity_num;
+    uint8_t coeff_num;
+    uint8_t parity_row[kRaidxMaxParityRows];
+    uint8_t coeff[kRaidxMaxParityRows];
+    uint8_t recon_coeff;
     uint8_t last_index;
+    int8_t recon_next_index;
     uint8_t num_sge[2]; // first one is for read or write, second one is for reconstruction
     struct sg_entry sgl[32]; // maximum number of allowed sg_entries is 16, same as SPDK; maximum is 32
     // first num_sge[0] are for read or write, the following num_sge[1] are for reconstruction
     // if we do not need 32 sg_entries, we will just copy part of cs_message_t into the message
 };
+
+static inline void
+cs_msg_init(struct cs_message_t *cs_msg)
+{
+    uint64_t req_id = cs_msg->req_id;
+
+    memset(cs_msg, 0, sizeof(*cs_msg));
+    cs_msg->req_id = req_id;
+    cs_msg->recon_coeff = 1;
+    cs_msg->recon_next_index = -1;
+    for (uint8_t i = 0; i < kRaidxMaxTargets; ++i) {
+        cs_msg->target_index[i] = -1;
+        cs_msg->missing_index[i] = kInvalidMissingIndex;
+        cs_msg->parity_row[i] = UINT8_MAX;
+        cs_msg->coeff[i] = 0;
+    }
+}
 
 struct cs_resp_t {
     uint64_t req_id;
@@ -123,6 +167,7 @@ struct send_wr_wrapper_server {
     struct cs_resp_t *cs_resp;
     struct ibv_send_wr send_wr_write[16];
     struct recv_wr_wrapper_server *ctx;
+    bool await_callback;
     TAILQ_ENTRY(send_wr_wrapper_server) link;
 };
 
@@ -160,7 +205,9 @@ enum action {
 
 enum target {
     PEER1,
-    PEER2
+    PEER2,
+    PEER3,
+    PEER4
 };
 
 enum request_state {
@@ -246,6 +293,9 @@ enum request_state {
     /// recon diff
     RECON_DF_START,
     RECON_DF_READ_DONE, // 60
+    /// reconstructed degraded-data write delta
+    RECON_DIFF_READ_DONE,
+    RECON_DIFF_PEND,
     /// end state
     RELEASE
 };
@@ -269,10 +319,15 @@ struct bdev_context_t {
     char *buff2;
     char* buff3;
     char* buff4;
+    char* buff5;
     uint64_t offset;
     uint64_t size;
     bool success;
     size_t recv_cnt;
+    size_t pending_send_completions;
+    size_t pending_peer_callbacks;
+    bool io_done;
+    bool host_resp_sent;
 };
 
 static inline size_t num_lcores_per_numa_node() {

@@ -42,6 +42,8 @@ struct rpc_bdev_raid_create {
     /* RAID raid level */
     enum raid_level                      level; // 5 or 6
 
+    uint8_t                              num_parities;
+
     uint8_t                              num_qp;
 
     /* Base bdevs information */
@@ -141,6 +143,7 @@ static const struct spdk_json_object_decoder rpc_bdev_raid_create_decoders[] = {
         {"host_ip", offsetof(struct rpc_bdev_raid_create, host_ip), spdk_json_decode_string},
         {"strip_size_kb", offsetof(struct rpc_bdev_raid_create, strip_size_kb), spdk_json_decode_uint32, true},
         {"raid_level", offsetof(struct rpc_bdev_raid_create, level), decode_raid_level},
+        {"num_parities", offsetof(struct rpc_bdev_raid_create, num_parities), spdk_json_decode_uint8, true},
         {"num_qp", offsetof(struct rpc_bdev_raid_create, num_qp), spdk_json_decode_uint8, true},
         {"base_rpcs", offsetof(struct rpc_bdev_raid_create, base_rpcs), decode_base_rpcs}
 };
@@ -182,8 +185,13 @@ rpc_bdev_raid_create(struct spdk_jsonrpc_request *request,
         goto cleanup;
     }
 
+    if (req.level == RAIDX && req.num_parities == 0) {
+        spdk_jsonrpc_send_error_response(request, EINVAL, "num_parities not specified for raidx");
+        goto cleanup;
+    }
+
     rc = raid_bdev_config_add(req.name, req.strip_size_kb, req.num_qp, req.base_rpcs.num_base_rpcs,
-                              req.level,
+                              req.level, req.num_parities,
                               &raid_cfg);
     if (rc != 0) {
         spdk_jsonrpc_send_error_response_fmt(request, rc,

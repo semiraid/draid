@@ -58,6 +58,7 @@ add_library(bdev_raid_rpc STATIC
     bdev_raid.cc
     raid5.cc
     raid6.cc
+    raidx.cc
 )
 
 target_compile_options(bdev_raid_rpc PRIVATE
