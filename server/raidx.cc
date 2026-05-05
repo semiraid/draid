@@ -9,6 +9,8 @@ static uint32_t g_strip_size = 0;
 static std::vector<std::string> ip_addrs;
 static int8_t g_numOfServers = -1;
 static uint8_t g_num_qp = 1;
+static uint8_t g_raidx_parity_count = kRaidxMaxParityRows;
+static uint32_t g_raidx_queue_depth = 32;
 static struct bdev_context_t *g_bdev_context;
 
 static struct rte_hash *g_req_hash = NULL;
@@ -62,6 +64,58 @@ static struct spdk_poller *g_poller;
 
 void rdma_send_resp(struct send_wr_wrapper_server *send_wrapper, uint64_t req_id);
 void rdma_recv(struct recv_wr_wrapper_server *recv_wrapper);
+
+static bool
+raidx_needs_buff5(void)
+{
+    return g_raidx_parity_count >= kRaidxMaxParityRows;
+}
+
+static uint32_t
+raidx_queue_depth(void)
+{
+    return g_raidx_queue_depth;
+}
+
+static void
+raidx_load_parity_count_from_env(void)
+{
+    const char *value = getenv("SEMIRAID_RAIDX_PARITY_COUNT");
+    char *end = NULL;
+    long parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return;
+    }
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 1 || parsed > kRaidxMaxParityRows) {
+        fprintf(stderr, "invalid SEMIRAID_RAIDX_PARITY_COUNT=%s\n", value);
+        exit(EXIT_FAILURE);
+    }
+
+    g_raidx_parity_count = (uint8_t) parsed;
+}
+
+static void
+raidx_load_queue_depth_from_env(void)
+{
+    const char *value = getenv("SEMIRAID_RAIDX_QUEUE_DEPTH");
+    char *end = NULL;
+    long parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return;
+    }
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 1 || parsed > paraSend) {
+        fprintf(stderr, "invalid SEMIRAID_RAIDX_QUEUE_DEPTH=%s\n", value);
+        exit(EXIT_FAILURE);
+    }
+
+    g_raidx_queue_depth = (uint32_t) parsed;
+}
 
 void show_buffer(unsigned char *buf, long buffer_size){
     char tmp[555];
@@ -117,6 +171,11 @@ raidx_contribution_buffer(struct bdev_context_t *bdev_context, uint8_t target_po
         case 2:
             return bdev_context->buff4;
         case 3:
+            if (bdev_context->buff5 == NULL) {
+                SPDK_ERRLOG("target position 3 requested with parity count %u\n",
+                            g_raidx_parity_count);
+                assert(false);
+            }
             return bdev_context->buff5;
         default:
             SPDK_ERRLOG("Illegal target position: %u\n", target_pos);
@@ -212,14 +271,16 @@ allocate_bdev_context(void)
         free(tmp);
         return NULL;
     }
-    tmp->buff5 = (char*) spdk_dma_zmalloc(g_strip_size * g_bdev_context->blk_size, g_bdev_context->buf_align, NULL);
-    if (!tmp->buff5) {
-        spdk_dma_free(tmp->buff1);
-        spdk_dma_free(tmp->buff2);
-        spdk_dma_free(tmp->buff3);
-        spdk_dma_free(tmp->buff4);
-        free(tmp);
-        return NULL;
+    if (raidx_needs_buff5()) {
+        tmp->buff5 = (char*) spdk_dma_zmalloc(g_strip_size * g_bdev_context->blk_size, g_bdev_context->buf_align, NULL);
+        if (!tmp->buff5) {
+            spdk_dma_free(tmp->buff1);
+            spdk_dma_free(tmp->buff2);
+            spdk_dma_free(tmp->buff3);
+            spdk_dma_free(tmp->buff4);
+            free(tmp);
+            return NULL;
+        }
     }
     tmp->buff = tmp->buff1;
     return tmp;
@@ -231,11 +292,21 @@ free_bdev_context(struct bdev_context_t* ptr)
     if (!ptr) {
         return;
     }
-    spdk_dma_free(ptr->buff1);
-    spdk_dma_free(ptr->buff2);
-    spdk_dma_free(ptr->buff3);
-    spdk_dma_free(ptr->buff4);
-    spdk_dma_free(ptr->buff5);
+    if (ptr->buff1) {
+        spdk_dma_free(ptr->buff1);
+    }
+    if (ptr->buff2) {
+        spdk_dma_free(ptr->buff2);
+    }
+    if (ptr->buff3) {
+        spdk_dma_free(ptr->buff3);
+    }
+    if (ptr->buff4) {
+        spdk_dma_free(ptr->buff4);
+    }
+    if (ptr->buff5) {
+        spdk_dma_free(ptr->buff5);
+    }
     free(ptr);
 }
 
@@ -1561,15 +1632,15 @@ connect_rdma_connections(void)
             continue;
         }
 
-        g_server_qp_list[i].cmd_sendbuf = (uint8_t *) calloc(paraSend * g_num_qp * 2, bufferSize);
+        g_server_qp_list[i].cmd_sendbuf = (uint8_t *) calloc(raidx_queue_depth() * g_num_qp * 2, bufferSize);
         if (!g_server_qp_list[i].cmd_sendbuf) {
             SPDK_ERRLOG("allocate buffer failed\n");
             assert(false);
         }
-        g_server_qp_list[i].cmd_recvbuf = g_server_qp_list[i].cmd_sendbuf + paraSend * g_num_qp * bufferSize;
+        g_server_qp_list[i].cmd_recvbuf = g_server_qp_list[i].cmd_sendbuf + raidx_queue_depth() * g_num_qp * bufferSize;
 
         TAILQ_INIT(&g_server_qp_list[i].free_send);
-        for (j = 0; j < paraSend * g_num_qp; j++) {
+        for (j = 0; j < raidx_queue_depth() * g_num_qp; j++) {
             struct ibv_sge *send_sge = (struct ibv_sge *) calloc(1, sizeof(struct ibv_sge));
             if (!send_sge) {
                 SPDK_ERRLOG("failed to allocate send_sge\n");
@@ -1638,15 +1709,15 @@ connect_rdma_connections(void)
     }
     // host
     for (i = 0; i < g_num_qp; i++) {
-        g_host_qp_list[i].cmd_sendbuf = (uint8_t *) calloc(paraSend * 2, bufferSize);
+        g_host_qp_list[i].cmd_sendbuf = (uint8_t *) calloc(raidx_queue_depth() * 2, bufferSize);
         if (!g_host_qp_list[i].cmd_sendbuf) {
             SPDK_ERRLOG("allocate buffer failed\n");
             assert(false);
         }
-        g_host_qp_list[i].cmd_recvbuf = g_host_qp_list[i].cmd_sendbuf + paraSend * bufferSize;
+        g_host_qp_list[i].cmd_recvbuf = g_host_qp_list[i].cmd_sendbuf + raidx_queue_depth() * bufferSize;
 
         TAILQ_INIT(&g_host_qp_list[i].free_send);
-        for (j = 0; j < paraSend; j++) {
+        for (j = 0; j < raidx_queue_depth(); j++) {
             struct ibv_sge *send_sge = (struct ibv_sge *) calloc(1, sizeof(struct ibv_sge));
             if (!send_sge) {
                 SPDK_ERRLOG("failed to allocate send_sge\n");
@@ -1814,7 +1885,7 @@ connect_rdma_connections(void)
         // 首次 bind 后，从 cm_id->verbs 获取实际选中的 RDMA 设备，创建全局 CQ
         // 避免 contexts[] 硬编码索引导致设备错配（如 192.168.1.x 返回 contexts[1] 而非 contexts[0]）
         if (g_cq == NULL) {
-            g_cq = ibv_create_cq(host_cmd_cm_id_list[i]->verbs, paraSend * g_num_qp * 2, NULL, NULL, 0);
+            g_cq = ibv_create_cq(host_cmd_cm_id_list[i]->verbs, raidx_queue_depth() * g_num_qp * 2, NULL, NULL, 0);
             assert(g_cq != NULL);
         }
         ret = rdma_listen(host_cmd_cm_id_list[i], 10);
@@ -1867,9 +1938,9 @@ connect_rdma_connections(void)
         svr_cmd_pd_list[i] = svr_cmd_cm_id_list[i]->pd;
         g_server_qp_list[i].cmd_cm_id = svr_cmd_cm_id_list[i];
 
-        qp_attr.cap.max_send_wr = paraSend * g_num_qp;
+        qp_attr.cap.max_send_wr = raidx_queue_depth() * g_num_qp;
         qp_attr.cap.max_send_sge = 1;
-        qp_attr.cap.max_recv_wr = paraSend * g_num_qp;
+        qp_attr.cap.max_recv_wr = raidx_queue_depth() * g_num_qp;
         qp_attr.cap.max_recv_sge = 1;
         qp_attr.send_cq = g_cq;
         qp_attr.recv_cq = g_cq;
@@ -1884,7 +1955,7 @@ connect_rdma_connections(void)
 
         g_server_qp_list[i].cmd_mr = ibv_reg_mr(svr_cmd_pd_list[i],
                                                 g_server_qp_list[i].cmd_sendbuf,
-                                                paraSend * g_num_qp * bufferSize * 2,
+                                                raidx_queue_depth() * g_num_qp * bufferSize * 2,
                                                 IBV_ACCESS_LOCAL_WRITE);
         if (!g_server_qp_list[i].cmd_mr) {
             SPDK_ERRLOG("register memory failed\n");
@@ -1950,9 +2021,9 @@ connect_rdma_connections(void)
 
         svr_cmd_pd_list[i] = g_server_qp_list[i].cmd_cm_id->pd;
 
-        qp_attr.cap.max_send_wr = paraSend * g_num_qp;
+        qp_attr.cap.max_send_wr = raidx_queue_depth() * g_num_qp;
         qp_attr.cap.max_send_sge = 1;
-        qp_attr.cap.max_recv_wr = paraSend * g_num_qp;
+        qp_attr.cap.max_recv_wr = raidx_queue_depth() * g_num_qp;
         qp_attr.cap.max_recv_sge = 1;
         qp_attr.send_cq = g_cq;
         qp_attr.recv_cq = g_cq;
@@ -1966,7 +2037,7 @@ connect_rdma_connections(void)
 
         g_server_qp_list[i].cmd_mr = ibv_reg_mr(svr_cmd_pd_list[i],
                                                 g_server_qp_list[i].cmd_sendbuf,
-                                                paraSend * g_num_qp * bufferSize * 2,
+                                                raidx_queue_depth() * g_num_qp * bufferSize * 2,
                                                 IBV_ACCESS_LOCAL_WRITE);
         if (!g_server_qp_list[i].cmd_mr) {
             SPDK_ERRLOG("register memory failed\n");
@@ -2044,9 +2115,9 @@ connect_rdma_connections(void)
 
         host_cmd_pd_list[i] = g_host_qp_list[i].cmd_cm_id->pd;
 
-        qp_attr.cap.max_send_wr = spdk_min(paraSend * 17, 4096);
+        qp_attr.cap.max_send_wr = spdk_min(raidx_queue_depth() * 17, 4096U);
         qp_attr.cap.max_send_sge = 1;
-        qp_attr.cap.max_recv_wr = paraSend;
+        qp_attr.cap.max_recv_wr = raidx_queue_depth();
         qp_attr.cap.max_recv_sge = 1;
         qp_attr.send_cq = g_cq;
         qp_attr.recv_cq = g_cq;
@@ -2060,7 +2131,7 @@ connect_rdma_connections(void)
 
         g_host_qp_list[i].cmd_mr = ibv_reg_mr(host_cmd_pd_list[i],
                                               g_host_qp_list[i].cmd_sendbuf,
-                                              paraSend * bufferSize * 2,
+                                              raidx_queue_depth() * bufferSize * 2,
                                               IBV_ACCESS_LOCAL_WRITE);
         if (!g_host_qp_list[i].cmd_mr) {
             SPDK_ERRLOG("register memory failed\n");
@@ -2123,7 +2194,7 @@ bdev_start(void *arg1)
     int rc = 0;
     struct rte_hash_parameters hash_params = {0};
     char name_buf[32];
-    hash_params.entries = paraSend * g_num_qp;
+    hash_params.entries = raidx_queue_depth() * g_num_qp;
     hash_params.key_len = sizeof(uint64_t);
 
     bdev_context->bdev_thread = spdk_get_thread();
@@ -2160,6 +2231,8 @@ bdev_start(void *arg1)
     bdev_context->blockcnt = bdev_context->bdev->blockcnt;
     bdev_context->buf_align = spdk_max(spdk_bdev_get_buf_align(bdev_context->bdev), 32);
     g_strip_size = g_strip_size * 1024 / bdev_context->blk_size;
+    SPDK_NOTICELOG("RAIDX parity count: %u, queue depth: %u\n",
+                   g_raidx_parity_count, raidx_queue_depth());
 
     snprintf(name_buf, sizeof(name_buf), "raidx_hash_req");
     hash_params.name = name_buf;
@@ -2199,6 +2272,8 @@ main(int argc, char **argv)
                                   bdev_usage)) != SPDK_APP_PARSE_ARGS_SUCCESS) {
         exit(rc);
     }
+    raidx_load_parity_count_from_env();
+    raidx_load_queue_depth_from_env();
     g_bdev_context->bdev_name = g_bdev_name;
 
     std::ifstream addrs(g_addr_file, std::ios::in);

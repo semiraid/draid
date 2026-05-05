@@ -972,6 +972,52 @@ raidx_dispatch_partial_write(struct raidx_request_ctx *request_ctx, uint64_t str
         return 0;
     }
 
+    if (stripe_state->degraded_data_count == 0 && stripe_state->degraded_parity_count == 0) {
+        for (const auto &chunk : touched_chunks) {
+            uint64_t chunk_len = chunk.req_blocks << raid_bdev->blocklen_shift;
+            uint64_t base_offset_blocks = (stripe_index << raid_bdev->strip_size_shift) + chunk.req_offset;
+            uint64_t parity_offset_blocks = parity_base_offset + chunk.req_offset;
+            uint8_t coeff[kRaidxMaxParityRows];
+
+            for (uint8_t parity_idx = 0; parity_idx < stripe_state->surviving_parity_count; ++parity_idx) {
+                uint8_t parity_chunk_idx = stripe_state->surviving_parity_slots[parity_idx];
+                uint8_t single_row = stripe_state->surviving_parity_rows[parity_idx];
+
+                coeff[parity_idx] = raidx_parity_coeff(single_row, chunk.data_index);
+
+                ret = raidx_dispatch_to_rpc_partial(request_ctx, parity_chunk_idx,
+                                                    parity_offset_blocks, chunk.req_blocks,
+                                                    parity_offset_blocks, chunk.req_blocks,
+                                                    kReqTypeParity, PR_DIFF, 0,
+                                                    1, NULL, 0, 0, 0,
+                                                    NULL, 0, &single_row, 1,
+                                                    NULL, 0);
+                if (ret != 0) {
+                    return ret;
+                }
+
+                request_ctx->pending++;
+            }
+
+            ret = raidx_dispatch_to_rpc_partial(request_ctx, chunk.chunk_idx,
+                                                base_offset_blocks, chunk.req_blocks,
+                                                parity_offset_blocks, chunk.req_blocks,
+                                                kReqTypePartialWrite, FWD_RW_DIFF, chunk.data_index,
+                                                0, bdev_io->u.bdev.iovs, bdev_io->u.bdev.iovcnt,
+                                                chunk.iov_offset, chunk_len,
+                                                target_index, stripe_state->surviving_parity_count,
+                                                parity_row, stripe_state->surviving_parity_count,
+                                                coeff, stripe_state->surviving_parity_count);
+            if (ret != 0) {
+                return ret;
+            }
+
+            request_ctx->pending++;
+        }
+
+        return 0;
+    }
+
     for (const auto &chunk : touched_chunks) {
         if (raid_bdev->base_rpc_info[chunk.chunk_idx].degraded) {
             struct raidx_recon_plan plan;
