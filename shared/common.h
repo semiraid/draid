@@ -10,7 +10,7 @@
 #include <numa.h>
 #include <fstream>
 #include <iostream>
-#include <regex>
+#include <string>
 
 #include "spdk/stdinc.h"
 #include "spdk/thread.h"
@@ -383,8 +383,7 @@ static inline uint8_t get_phy_port(void)
 
 static inline uint8_t get_phy_port_by_ip_addr(std::string ip_addr)
 {
-    std::regex nic_100g("(192\\.168\\.2\\.)([1-9]|[1-9][0-9])");
-    if (std::regex_match(ip_addr, nic_100g)) {
+    if (ip_addr.rfind("192.168.2.", 0) == 0) {
         return 2;
     } else {
         return 1;
