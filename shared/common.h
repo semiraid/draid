@@ -180,7 +180,7 @@ struct recv_wr_wrapper_server {
     struct bdev_context_t *bdev_context;
 };
 
-static constexpr uint64_t kMaxBlockcnt = 256 * 1024 * 1024;
+static constexpr uint64_t kMaxBlockcnt = 1024ULL * 1024ULL * 1024ULL;
 static constexpr uint8_t kReqTypeRW = 3; // setup initial data
 static constexpr uint8_t kReqTypePartialWrite = 4; // client to data server
 static constexpr uint8_t kReqTypeParity = 5; // client to parity server
