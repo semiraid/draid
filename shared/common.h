@@ -74,6 +74,7 @@ struct cs_message_t {
     uint8_t data_index;
     uint8_t target_num;
     uint64_t req_id;
+    uint64_t request_group_id;
     union {
         struct {
             int8_t next_index;
@@ -131,6 +132,7 @@ cs_msg_init(struct cs_message_t *cs_msg)
 
 struct cs_resp_t {
     uint64_t req_id;
+    uint64_t request_group_id;
 };
 
 struct rdma_send_wr_list {

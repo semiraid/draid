@@ -4,7 +4,7 @@
 #include "spdk/bdev_module.h"
 #include "../shared/common.h"
 
-#define RAID_MAX_STRIPES 4096
+#define RAID_MAX_STRIPES 256
 
 enum raid_level {
     INVALID_RAID_LEVEL	= -1,
@@ -33,7 +33,11 @@ struct send_wr_wrapper {
     void *ctx;
     spdk_msg_fn cb;
     uint64_t num_blocks;
+    uint64_t request_group_id;
     uint8_t rtn_cnt;
+    uint8_t expected_rtn_cnt;
+    bool send_done;
+    bool callback_done;
     void *buf;
     TAILQ_ENTRY(send_wr_wrapper) link;
 };
@@ -188,6 +192,8 @@ struct raid_bdev_config {
 
     uint8_t			    num_qp;
 
+    uint8_t             qp_slot_base;
+
     /* number of base bdevs */
     uint8_t				num_base_rpcs;
 
@@ -221,6 +227,8 @@ struct raid_bdev_io_channel {
     struct spdk_poller *poller;
 
     struct rdma_qp_group *qp_group;
+
+    bool shared_qp_group;
 
 };
 
@@ -267,8 +275,19 @@ static inline struct send_wr_wrapper * raid_get_send_wrapper(struct raid_bdev_io
     return send_wrapper;
 }
 static inline void void_cont_func_rdma(struct send_wr_wrapper *send_wrapper) {
-    if (send_wrapper->rtn_cnt == 0) {
+    if (send_wrapper->send_done) {
+        SPDK_ERRLOG("ignore duplicate dRAID send completion req_id=%p group=%" PRIu64 "\n",
+                    send_wrapper, send_wrapper->request_group_id);
+        return;
+    }
+
+    send_wrapper->send_done = true;
+    if (send_wrapper->expected_rtn_cnt == 0 && !send_wrapper->callback_done) {
+        send_wrapper->callback_done = true;
         send_wrapper->cb((void *) send_wrapper);
+    }
+
+    if (send_wrapper->callback_done) {
         TAILQ_INSERT_TAIL(&send_wrapper->rqp->free_send, send_wrapper, link);
     }
 }

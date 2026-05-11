@@ -518,6 +518,7 @@ raid5_dispatch_to_rpc(struct raid5_info *r5info, uint8_t chunk_idx, uint64_t bas
     struct ibv_send_wr *send_wr = &send_wrapper->send_wr;
     struct ibv_sge *sge = send_wr->sg_list;
     struct cs_message_t *cs_msg = (struct cs_message_t *) sge->addr;
+    cs_msg_init(cs_msg);
     cs_msg->type = cs_type;
     cs_msg->offset = base_offset_blocks;
     cs_msg->length = num_blocks;
@@ -660,6 +661,7 @@ raid5_dispatch_to_rpc_d_raid(struct raid5_info *r5info, uint8_t chunk_idx,
     struct ibv_send_wr *send_wr = &send_wrapper->send_wr;
     struct ibv_sge *sge = send_wr->sg_list;
     struct cs_message_t *cs_msg = (struct cs_message_t *) sge->addr;
+    cs_msg_init(cs_msg);
     cs_msg->type = cs_type;
     cs_msg->offset = base_offset_blocks;
     cs_msg->length = num_blocks;
@@ -1374,6 +1376,7 @@ raid5_dispatch_to_rpc_read(struct raid_bdev_io *raid_io, uint8_t chunk_idx, uint
     struct ibv_send_wr *send_wr = &send_wrapper->send_wr;
     struct ibv_sge *sge = send_wr->sg_list;
     struct cs_message_t *cs_msg = (struct cs_message_t *) sge->addr;
+    cs_msg_init(cs_msg);
 
     int chunk_iovcnt = raid5_map_iov(cs_msg->sgl, iov, total_iovcnt, iov_offset, chunk_len);
 
@@ -1523,8 +1526,10 @@ raid5_stripe_init(struct stripe *stripe, struct raid_bdev *raid_bdev)
             SPDK_ERRLOG("Failed to allocate chunk buffer\n");
             for (i = i - 1; i >= 0; i--) {
                 spdk_dma_free(stripe->chunk_buffers[i]);
+                stripe->chunk_buffers[i] = NULL;
             }
             free(stripe->chunk_buffers);
+            stripe->chunk_buffers = NULL;
             return -ENOMEM;
         }
         stripe->chunk_buffers[i] = buf;
@@ -1541,10 +1546,18 @@ raid5_stripe_deinit(struct stripe *stripe, struct raid_bdev *raid_bdev)
 {
     uint8_t i;
 
+    if (stripe->chunk_buffers == NULL) {
+        return;
+    }
+
     for (i = 0; i < 1; i++) {
-        spdk_dma_free(stripe->chunk_buffers[i]);
+        if (stripe->chunk_buffers[i] != NULL) {
+            spdk_dma_free(stripe->chunk_buffers[i]);
+            stripe->chunk_buffers[i] = NULL;
+        }
     }
     free(stripe->chunk_buffers);
+    stripe->chunk_buffers = NULL;
 
     pthread_spin_destroy(&stripe->requests_lock);
 }
@@ -1615,18 +1628,19 @@ raid5_start(struct raid_bdev *raid_bdev)
 
     TAILQ_INIT(&r5info->free_stripes);
 
-    for (i = 0; i < RAID_MAX_STRIPES; i++) {
-        struct stripe *stripe = &r5info->stripes[i];
+	    for (i = 0; i < RAID_MAX_STRIPES; i++) {
+	        struct stripe *stripe = &r5info->stripes[i];
 
-        ret = raid5_stripe_init(stripe, raid_bdev);
-        if (ret) {
-            for (; i > 0; --i) {
-                raid5_stripe_deinit(&r5info->stripes[i], raid_bdev);
-            }
-            free(r5info->stripes);
-            r5info->stripes = NULL;
-            goto out;
-        }
+	        ret = raid5_stripe_init(stripe, raid_bdev);
+	        if (ret) {
+	            while (i > 0) {
+	                --i;
+	                raid5_stripe_deinit(&r5info->stripes[i], raid_bdev);
+	            }
+	            free(r5info->stripes);
+	            r5info->stripes = NULL;
+	            goto out;
+	        }
 
         TAILQ_INSERT_TAIL(&r5info->free_stripes, stripe, link);
     }

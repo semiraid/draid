@@ -8,6 +8,10 @@
 #include "spdk/json.h"
 #include "../shared/common.h"
 
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+
 /* raid bdev config as read from config file */
 struct raid_config	g_raid_config = {
         .raid_bdev_config_head = TAILQ_HEAD_INITIALIZER(g_raid_config.raid_bdev_config_head),
@@ -17,6 +21,64 @@ struct raid_config	g_raid_config = {
 struct raid_all_tailq		g_raid_bdev_list = TAILQ_HEAD_INITIALIZER(g_raid_bdev_list);
 
 static TAILQ_HEAD(, raid_bdev_module) g_raid_modules = TAILQ_HEAD_INITIALIZER(g_raid_modules);
+
+static size_t
+raid_qp_free_send_count(struct rdma_qp *rqp)
+{
+    struct send_wr_wrapper *send_wrapper;
+    size_t count = 0;
+
+    if (rqp == NULL) {
+        return 0;
+    }
+
+    TAILQ_FOREACH(send_wrapper, &rqp->free_send, link) {
+        count++;
+    }
+
+    return count;
+}
+
+static size_t
+raid_send_wr_chain_count(struct ibv_send_wr *first, struct ibv_send_wr **last)
+{
+    struct ibv_send_wr *wr;
+    size_t count = 0;
+
+    if (last != NULL) {
+        *last = NULL;
+    }
+
+    for (wr = first; wr != NULL; wr = wr->next) {
+        count++;
+        if (last != NULL) {
+            *last = wr;
+        }
+    }
+
+    return count;
+}
+
+static uint32_t
+raid_host_qp_depth(void)
+{
+    const char *value = getenv("DRAID_HOST_QUEUE_DEPTH");
+    char *end = NULL;
+    long parsed;
+
+    if (value == NULL || value[0] == '\0') {
+        return paraSend;
+    }
+
+    parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 1 || parsed > 4096) {
+        SPDK_ERRLOG("invalid DRAID_HOST_QUEUE_DEPTH=%s, use default %u\n",
+                    value, paraSend);
+        return paraSend;
+    }
+
+    return (uint32_t) parsed;
+}
 
 void
 raid_memset_iovs(struct iovec *iovs, int iovcnt, char c)
@@ -136,9 +198,32 @@ static void
 req_handler_rdma(struct cs_resp_t *cs_resp) {
     struct send_wr_wrapper *send_wrapper = (struct send_wr_wrapper *) cs_resp->req_id;
 
+    if (spdk_unlikely(cs_resp->request_group_id != send_wrapper->request_group_id)) {
+        SPDK_ERRLOG("ignore stale dRAID callback req_id=%p resp_group=%" PRIu64 " current_group=%" PRIu64 "\n",
+                    send_wrapper, cs_resp->request_group_id, send_wrapper->request_group_id);
+        return;
+    }
+    if (spdk_unlikely(send_wrapper->expected_rtn_cnt == 0)) {
+        SPDK_ERRLOG("ignore unexpected dRAID callback for zero-response req_id=%p group=%" PRIu64 "\n",
+                    send_wrapper, send_wrapper->request_group_id);
+        return;
+    }
+    if (spdk_unlikely(send_wrapper->callback_done)) {
+        SPDK_ERRLOG("ignore duplicate dRAID callback req_id=%p group=%" PRIu64 "\n",
+                    send_wrapper, send_wrapper->request_group_id);
+        return;
+    }
+    if (spdk_unlikely(send_wrapper->rtn_cnt == 0)) {
+        SPDK_ERRLOG("ignore unexpected dRAID callback req_id=%p group=%" PRIu64 "\n",
+                    send_wrapper, send_wrapper->request_group_id);
+        return;
+    }
     if (--send_wrapper->rtn_cnt == 0) {
+        send_wrapper->callback_done = true;
         send_wrapper->cb((void *) send_wrapper);
-        TAILQ_INSERT_TAIL(&send_wrapper->rqp->free_send, send_wrapper, link);
+        if (send_wrapper->send_done) {
+            TAILQ_INSERT_TAIL(&send_wrapper->rqp->free_send, send_wrapper, link);
+        }
     }
 }
 
@@ -170,7 +255,7 @@ raid_poll_qp(void *arg)
         for (i = 0; i < num_cqe; i++) {
             if (spdk_unlikely(wc[i].status != IBV_WC_SUCCESS)) {
                 SPDK_ERRLOG("wc status error status=%u, opcode=%u\n", wc[i].status, wc[i].opcode);
-                assert(false);
+                continue;
             }
             id = wc[i].wr_id;
             if (wc[i].opcode == IBV_WC_SEND) {
@@ -201,17 +286,41 @@ raid_poll_qp(void *arg)
     for (i = 0; i < num_rpcs; i++) {
 
         rqp = raid_ch->qp_group->qps[i];
+        if (spdk_unlikely(rqp == NULL)) {
+            continue;
+        }
 
-        if (spdk_unlikely(ibv_post_send(rqp->cmd_cm_id->qp, rqp->send_wrs.first, &bad_send_wr))) {
-            SPDK_ERRLOG("post send failed\n");
-            assert(false);
+        if (rqp->recv_wrs.first != NULL) {
+            int post_rc = ibv_post_recv(rqp->cmd_cm_id->qp, rqp->recv_wrs.first, &bad_recv_wr);
+            if (post_rc != 0) {
+                SPDK_ERRLOG("post recv failed rc=%d errno=%d (%s) bad_wr=%p qp=%p\n",
+                            post_rc, errno, strerror(errno), (void *)bad_recv_wr,
+                            rqp->cmd_cm_id == NULL ? NULL : (void *)rqp->cmd_cm_id->qp);
+                assert(false);
+            }
+            rqp->recv_wrs.first = NULL;
+            rqp->recv_wrs.last = NULL;
         }
-        rqp->send_wrs.first = NULL;
-        if (ibv_post_recv(rqp->cmd_cm_id->qp, rqp->recv_wrs.first, &bad_recv_wr)) {
-            SPDK_ERRLOG("post recv failed\n");
-            assert(false);
+        if (rqp->send_wrs.first != NULL) {
+            int post_rc = ibv_post_send(rqp->cmd_cm_id->qp, rqp->send_wrs.first, &bad_send_wr);
+            if (spdk_unlikely(post_rc != 0)) {
+                struct ibv_send_wr *retry_last = NULL;
+                SPDK_ERRLOG("post send failed rc=%d errno=%d (%s) pending_send=%zu "
+                            "free_send=%zu bad_wr=%p qp=%p; retry pending sends\n",
+                            post_rc, errno, strerror(errno), rqp->send_wrs.size,
+                            raid_qp_free_send_count(rqp), (void *)bad_send_wr,
+                            rqp->cmd_cm_id == NULL ? NULL : (void *)rqp->cmd_cm_id->qp);
+                if (bad_send_wr != NULL) {
+                    rqp->send_wrs.first = bad_send_wr;
+                    rqp->send_wrs.size = raid_send_wr_chain_count(bad_send_wr, &retry_last);
+                    rqp->send_wrs.last = retry_last;
+                }
+                return SPDK_POLLER_BUSY;
+            }
+            rqp->send_wrs.first = NULL;
+            rqp->send_wrs.last = NULL;
+            rqp->send_wrs.size = 0;
         }
-        rqp->recv_wrs.first = NULL;
     }
 
     return total_cqe > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
@@ -244,8 +353,16 @@ raid_bdev_create_cb(void *io_device, void *ctx_buf)
 
     pthread_spin_lock(&raid_bdev->qp_group_lock);
     raid_ch->qp_group = TAILQ_FIRST(&raid_bdev->qp_groups);
-    assert(raid_ch->qp_group != NULL);
-    TAILQ_REMOVE(&raid_bdev->qp_groups, raid_ch->qp_group, link);
+    if (raid_ch->qp_group == NULL) {
+        pthread_spin_unlock(&raid_bdev->qp_group_lock);
+        SPDK_ERRLOG("no dRAID QP group available for IO channel: configured num_qp=%u\n",
+                    raid_bdev->num_qp);
+        return -ENOMEM;
+    }
+    raid_ch->shared_qp_group = raid_bdev->num_qp == 1;
+    if (!raid_ch->shared_qp_group) {
+        TAILQ_REMOVE(&raid_bdev->qp_groups, raid_ch->qp_group, link);
+    }
     pthread_spin_unlock(&raid_bdev->qp_group_lock);
 
     if (!ret && raid_bdev->module->io_channel_resource_init) {
@@ -285,12 +402,14 @@ raid_bdev_destroy_cb(void *io_device, void *ctx_buf)
         raid_bdev->module->io_channel_resource_deinit(raid_bdev_io_channel_get_resource(raid_ch));
     }
 
-    assert(raid_ch->qp_group != NULL);
-    pthread_spin_lock(&raid_bdev->qp_group_lock);
-    TAILQ_INSERT_TAIL(&raid_bdev->qp_groups, raid_ch->qp_group, link);
-    pthread_spin_unlock(&raid_bdev->qp_group_lock);
+    if (raid_ch->qp_group != NULL && !raid_ch->shared_qp_group) {
+        pthread_spin_lock(&raid_bdev->qp_group_lock);
+        TAILQ_INSERT_TAIL(&raid_bdev->qp_groups, raid_ch->qp_group, link);
+        pthread_spin_unlock(&raid_bdev->qp_group_lock);
+    }
 
     raid_ch->qp_group = NULL;
+    raid_ch->shared_qp_group = false;
 }
 
 /*
@@ -802,6 +921,7 @@ setup_rdma(struct raid_bdev *raid_bdev, struct raid_bdev_config *raid_cfg)
 {
     int ret;
     uint8_t num_qp = raid_bdev->num_qp;
+    uint32_t host_qp_depth = raid_host_qp_depth();
     struct addrinfo	hints = {
             .ai_family    = AF_INET, // ipv4
             .ai_socktype  = SOCK_STREAM,
@@ -870,34 +990,36 @@ setup_rdma(struct raid_bdev *raid_bdev, struct raid_bdev_config *raid_cfg)
             }
             r_qp_group->qps[i] = rqp;
 
-            ret = getaddrinfo(raid_cfg->host_ip, std::to_string(kStartPort+i*num_qp+j).c_str(), &hints, &cmd_src[i][j]);
-            if (ret) {
-                SPDK_ERRLOG("getaddrinfo for src failed\n");
-                return -1;
-            }
+            uint8_t qp_slot = raid_cfg->qp_slot_base + j;
             ret = rdma_create_id(cmd_cm_channel_list[i][j], &rqp->cmd_cm_id, NULL, RDMA_PS_TCP);
             if (ret) {
                 SPDK_ERRLOG("Creating cm id failed with errno: %d \n", -errno);
                 return -1;
             }
-            ret = getaddrinfo(raid_cfg->base_rpcs[i].uri, std::to_string(kStartPort-1-j).c_str(), &hints, &cmd_dst[i][j]);
+            ret = getaddrinfo(raid_cfg->host_ip, "0", &hints, &cmd_src[i][j]);
+            if (ret) {
+                SPDK_ERRLOG("getaddrinfo for src failed: host_ip=%s\n", raid_cfg->host_ip);
+                return -1;
+            }
+            ret = getaddrinfo(raid_cfg->base_rpcs[i].uri, std::to_string(kStartPort-1-qp_slot).c_str(), &hints, &cmd_dst[i][j]);
             if (ret) {
                 SPDK_ERRLOG("getaddrinfo for dst failed\n");
                 return -1;
             }
-            // src_port=0：让内核分配临时端口，避免上次异常退出遗留的 EADDRINUSE
-            ((struct sockaddr_in *)cmd_src[i][j]->ai_addr)->sin_port = 0;
+            // 显式绑定 host_ip，避免多 RDMA 设备节点上由 RDMA CM 误选非私有 RDMA
+            // fabric；源端口使用 0 交给内核分配，避免多个 fio 进程复用同一端口。
             ret = rdma_resolve_addr(rqp->cmd_cm_id, cmd_src[i][j]->ai_addr, cmd_dst[i][j]->ai_addr, 2000);
             if (ret) {
-                char src_str[INET_ADDRSTRLEN], dst_str[INET_ADDRSTRLEN];
+                char src_str[INET_ADDRSTRLEN];
+                char dst_str[INET_ADDRSTRLEN];
                 struct sockaddr_in *s = (struct sockaddr_in *)cmd_src[i][j]->ai_addr;
                 struct sockaddr_in *d = (struct sockaddr_in *)cmd_dst[i][j]->ai_addr;
                 inet_ntop(AF_INET, &s->sin_addr, src_str, sizeof(src_str));
                 inet_ntop(AF_INET, &d->sin_addr, dst_str, sizeof(dst_str));
-                SPDK_ERRLOG("resolve_addr failed: errno=%d (%s), src=%s:%d dst=%s:%d\n",
+                SPDK_ERRLOG("resolve_addr failed: errno=%d (%s), src=%s:%d dst=%s:%d qp_slot=%u server=%u\n",
                             errno, strerror(errno),
                             src_str, ntohs(s->sin_port),
-                            dst_str, ntohs(d->sin_port));
+                            dst_str, ntohs(d->sin_port), qp_slot, i);
                 return -1;
             }
             ret = rdma_get_cm_event(cmd_cm_channel_list[i][j], &event);
@@ -906,14 +1028,27 @@ setup_rdma(struct raid_bdev *raid_bdev, struct raid_bdev_config *raid_cfg)
                 return -1;
             }
             if (event->event != RDMA_CM_EVENT_ADDR_RESOLVED) {
-                SPDK_ERRLOG("event is not RDMA_CM_EVENT_ADDR_RESOLVED\n");
+                char src_str[INET_ADDRSTRLEN];
+                char dst_str[INET_ADDRSTRLEN];
+                struct sockaddr_in *s = (struct sockaddr_in *)cmd_src[i][j]->ai_addr;
+                struct sockaddr_in *d = (struct sockaddr_in *)cmd_dst[i][j]->ai_addr;
+                inet_ntop(AF_INET, &s->sin_addr, src_str, sizeof(src_str));
+                int status_errno = event->status < 0 ? -event->status : event->status;
+                inet_ntop(AF_INET, &d->sin_addr, dst_str, sizeof(dst_str));
+                SPDK_ERRLOG("addr resolution failed: event=%s(%d) status=%d (%s), src=%s:%d dst=%s:%d qp_slot=%u server=%u\n",
+                            rdma_event_str(event->event), event->event,
+                            event->status, strerror(status_errno),
+                            src_str, ntohs(s->sin_port),
+                            dst_str, ntohs(d->sin_port), qp_slot, i);
+                rdma_ack_cm_event(event);
                 return -1;
             }
             rdma_ack_cm_event(event);
 
             // 在首次地址解析后用实际选中的设备创建 CQ（同一 QP group 所有连接共用一个 CQ）
             if (r_qp_group->cq == NULL) {
-                r_qp_group->cq = ibv_create_cq(rqp->cmd_cm_id->verbs, 4096, NULL, NULL, 0);
+                uint32_t cq_entries = spdk_max(host_qp_depth * raid_bdev->num_base_rpcs * 2U, 4096U);
+                r_qp_group->cq = ibv_create_cq(rqp->cmd_cm_id->verbs, cq_entries, NULL, NULL, 0);
                 if (!r_qp_group->cq) {
                     SPDK_ERRLOG("ibv_create_cq failed\n");
                     return -1;
@@ -937,9 +1072,9 @@ setup_rdma(struct raid_bdev *raid_bdev, struct raid_bdev_config *raid_cfg)
 
             rqp->mem_map = spdk_rdma_create_mem_map_external(rqp->cmd_cm_id->pd);
 
-            qp_attr.cap.max_send_wr = paraSend;
+            qp_attr.cap.max_send_wr = host_qp_depth;
             qp_attr.cap.max_send_sge = 1;
-            qp_attr.cap.max_recv_wr = paraSend;
+            qp_attr.cap.max_recv_wr = host_qp_depth;
             qp_attr.cap.max_recv_sge = 1;
             qp_attr.send_cq = r_qp_group->cq;
             qp_attr.recv_cq = r_qp_group->cq;
@@ -951,28 +1086,28 @@ setup_rdma(struct raid_bdev *raid_bdev, struct raid_bdev_config *raid_cfg)
             }
 
             // allocate buffer and pre-post recv
-            rqp->cmd_sendbuf = (uint8_t *) spdk_dma_zmalloc(paraSend * 2 * bufferSize, 32, NULL);
+            rqp->cmd_sendbuf = (uint8_t *) spdk_dma_zmalloc(host_qp_depth * 2 * bufferSize, 32, NULL);
             if (!rqp->cmd_sendbuf) {
                 SPDK_ERRLOG("allocate buffer failed\n");
                 return -1;
             }
-            rqp->cmd_recvbuf = rqp->cmd_sendbuf + paraSend * bufferSize;
+            rqp->cmd_recvbuf = rqp->cmd_sendbuf + host_qp_depth * bufferSize;
             rqp->cmd_mr = ibv_reg_mr(rqp->cmd_cm_id->pd,
                                      rqp->cmd_sendbuf,
-                                     paraSend * bufferSize * 2,
+                                     host_qp_depth * bufferSize * 2,
                                      IBV_ACCESS_LOCAL_WRITE);
             if (!rqp->cmd_mr) {
                 SPDK_ERRLOG("register memory failed\n");
                 return -1;
             }
 
-            uint8_t *buf = (uint8_t *)spdk_dma_zmalloc(paraSend * kMsgSize, 32, NULL);
+            uint8_t *buf = (uint8_t *)spdk_dma_zmalloc(host_qp_depth * kMsgSize, 32, NULL);
             if (!buf) {
                 SPDK_ERRLOG("Failed to allocate buf\n");
                 assert(false);
             }
             TAILQ_INIT(&rqp->free_send);
-            for (int k = 0; k < paraSend; k++) {
+            for (uint32_t k = 0; k < host_qp_depth; k++) {
                 struct ibv_sge *send_sge = (struct ibv_sge *) calloc(1, sizeof(struct ibv_sge));
                 if (!send_sge) {
                     SPDK_ERRLOG("Failed to allocate send_sge\n");
@@ -1026,11 +1161,15 @@ setup_rdma(struct raid_bdev *raid_bdev, struct raid_bdev_config *raid_cfg)
                 }
             }
 
-            if (ibv_post_recv(rqp->cmd_cm_id->qp, rqp->recv_wrs.first, &bad_recv_wr)) {
-                SPDK_ERRLOG("post send failed\n");
+            int post_recv_rc = ibv_post_recv(rqp->cmd_cm_id->qp, rqp->recv_wrs.first, &bad_recv_wr);
+            if (post_recv_rc != 0) {
+                SPDK_ERRLOG("post recv failed rc=%d errno=%d (%s) bad_wr=%p qp=%p\n",
+                            post_recv_rc, errno, strerror(errno), (void *)bad_recv_wr,
+                            rqp->cmd_cm_id == NULL ? NULL : (void *)rqp->cmd_cm_id->qp);
                 assert(false);
             }
             rqp->recv_wrs.first = NULL;
+            rqp->recv_wrs.last = NULL;
 
             ret = rdma_connect(rqp->cmd_cm_id, &conn_param);
             if(ret) {
@@ -1052,7 +1191,19 @@ setup_rdma(struct raid_bdev *raid_bdev, struct raid_bdev_config *raid_cfg)
                 return -1;
             }
             if (event->event != RDMA_CM_EVENT_ESTABLISHED) {
-                SPDK_ERRLOG("event is not RDMA_CM_EVENT_ESTABLISHED, but %d; i = %d, j = %d\n", event->event, i, j);
+                char src_str[INET_ADDRSTRLEN];
+                char dst_str[INET_ADDRSTRLEN];
+                struct sockaddr_in *s = (struct sockaddr_in *)cmd_src[i][j]->ai_addr;
+                struct sockaddr_in *d = (struct sockaddr_in *)cmd_dst[i][j]->ai_addr;
+                int status_errno = event->status < 0 ? -event->status : event->status;
+                inet_ntop(AF_INET, &s->sin_addr, src_str, sizeof(src_str));
+                inet_ntop(AF_INET, &d->sin_addr, dst_str, sizeof(dst_str));
+                SPDK_ERRLOG("event is not RDMA_CM_EVENT_ESTABLISHED: event=%s(%d) status=%d (%s), src=%s:%d dst=%s:%d i=%u j=%u\n",
+                            rdma_event_str(event->event), event->event,
+                            event->status, strerror(status_errno),
+                            src_str, ntohs(s->sin_port),
+                            dst_str, ntohs(d->sin_port), i, j);
+                rdma_ack_cm_event(event);
                 return -1;
             }
             rdma_ack_cm_event(event);
@@ -1077,6 +1228,7 @@ raid_bdev_create(struct raid_bdev_config *raid_cfg)
     struct raid_bdev *raid_bdev;
     struct spdk_bdev *raid_bdev_gen;
     struct raid_bdev_module *module;
+    int ret;
 
     module = raid_bdev_module_find(raid_cfg->level);
     if (module == NULL) {
@@ -1145,7 +1297,14 @@ raid_bdev_create(struct raid_bdev_config *raid_cfg)
     raid_bdev_gen->module = &g_raid_if;
     raid_bdev_gen->write_cache = 0;
 
-    setup_rdma(raid_bdev, raid_cfg);
+    ret = setup_rdma(raid_bdev, raid_cfg);
+    if (ret != 0) {
+        SPDK_ERRLOG("Unable to set up dRAID RDMA resources\n");
+        free(raid_bdev_gen->name);
+        free(raid_bdev->base_rpc_info);
+        free(raid_bdev);
+        return ret;
+    }
 
     TAILQ_INSERT_TAIL(&g_raid_bdev_list, raid_bdev, global_link);
 
@@ -1157,9 +1316,19 @@ raid_bdev_create(struct raid_bdev_config *raid_cfg)
 int
 raid_dispatch_to_rpc(struct send_wr_wrapper *send_wrapper)
 {
+    if (spdk_unlikely(send_wrapper == NULL || send_wrapper->rqp == NULL)) {
+        SPDK_ERRLOG("cannot dispatch dRAID RPC: no free send wrapper\n");
+        return -ENOMEM;
+    }
+
     struct ibv_send_wr *send_wr = &send_wrapper->send_wr;
     struct rdma_qp *rqp  = send_wrapper->rqp;
+    struct cs_message_t *cs_msg = (struct cs_message_t *) send_wr->sg_list->addr;
 
+    send_wrapper->request_group_id = cs_msg->request_group_id;
+    send_wrapper->expected_rtn_cnt = send_wrapper->rtn_cnt;
+    send_wrapper->send_done = false;
+    send_wrapper->callback_done = false;
     send_wr->next = NULL;
     if (rqp->send_wrs.first == NULL) {
         rqp->send_wrs.first = send_wr;
@@ -1168,6 +1337,7 @@ raid_dispatch_to_rpc(struct send_wr_wrapper *send_wrapper)
         rqp->send_wrs.last->next = send_wr;
         rqp->send_wrs.last = send_wr;
     }
+    rqp->send_wrs.size++;
 
     return 0;
 }

@@ -42,9 +42,11 @@ struct rpc_bdev_raid_create {
     /* RAID raid level */
     enum raid_level                      level; // 5 or 6
 
-    uint8_t                              num_parities;
+    uint32_t                             num_parities;
 
-    uint8_t                              num_qp;
+    uint32_t                             num_qp;
+
+    uint32_t                             qp_slot_base;
 
     /* Base bdevs information */
     struct rpc_bdev_raid_create_base_rpcs base_rpcs;
@@ -143,8 +145,9 @@ static const struct spdk_json_object_decoder rpc_bdev_raid_create_decoders[] = {
         {"host_ip", offsetof(struct rpc_bdev_raid_create, host_ip), spdk_json_decode_string},
         {"strip_size_kb", offsetof(struct rpc_bdev_raid_create, strip_size_kb), spdk_json_decode_uint32, true},
         {"raid_level", offsetof(struct rpc_bdev_raid_create, level), decode_raid_level},
-        {"num_parities", offsetof(struct rpc_bdev_raid_create, num_parities), spdk_json_decode_uint8, true},
-        {"num_qp", offsetof(struct rpc_bdev_raid_create, num_qp), spdk_json_decode_uint8, true},
+        {"num_parities", offsetof(struct rpc_bdev_raid_create, num_parities), spdk_json_decode_uint32, true},
+        {"num_qp", offsetof(struct rpc_bdev_raid_create, num_qp), spdk_json_decode_uint32, true},
+        {"qp_slot_base", offsetof(struct rpc_bdev_raid_create, qp_slot_base), spdk_json_decode_uint32, true},
         {"base_rpcs", offsetof(struct rpc_bdev_raid_create, base_rpcs), decode_base_rpcs}
 };
 
@@ -190,8 +193,19 @@ rpc_bdev_raid_create(struct spdk_jsonrpc_request *request,
         goto cleanup;
     }
 
-    rc = raid_bdev_config_add(req.name, req.strip_size_kb, req.num_qp, req.base_rpcs.num_base_rpcs,
-                              req.level, req.num_parities,
+    if (req.num_parities > UINT8_MAX) {
+        spdk_jsonrpc_send_error_response(request, EINVAL, "num_parities is too large");
+        goto cleanup;
+    }
+
+    if (req.num_qp > UINT8_MAX || req.qp_slot_base > UINT8_MAX ||
+        req.qp_slot_base + req.num_qp > UINT8_MAX) {
+        spdk_jsonrpc_send_error_response(request, EINVAL, "qp_slot_base + num_qp is too large");
+        goto cleanup;
+    }
+
+    rc = raid_bdev_config_add(req.name, req.strip_size_kb, (uint8_t)req.num_qp, req.base_rpcs.num_base_rpcs,
+                              req.level, (uint8_t)req.num_parities,
                               &raid_cfg);
     if (rc != 0) {
         spdk_jsonrpc_send_error_response_fmt(request, rc,
@@ -201,6 +215,7 @@ rpc_bdev_raid_create(struct spdk_jsonrpc_request *request,
     }
 
     raid_cfg->host_ip = strdup(req.host_ip);
+    raid_cfg->qp_slot_base = (uint8_t)req.qp_slot_base;
 
     for (i = 0; i < req.base_rpcs.num_base_rpcs; i++) {
         rc = raid_bdev_config_add_base_rpc(raid_cfg, req.base_rpcs.base_rpcs[i].uri, req.base_rpcs.base_rpcs[i].degraded, i);

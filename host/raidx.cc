@@ -39,6 +39,23 @@ struct raidx_partial_chunk {
     uint64_t iov_offset;
 };
 
+static int
+raidx_copy_payload_to_send_wrapper(struct send_wr_wrapper *send_wrapper,
+                                   const struct iovec *iov, int iovcnt,
+                                   uint64_t iov_offset, uint64_t len)
+{
+    struct iovec dst_iov;
+
+    if (len > kMsgSize) {
+        return -EINVAL;
+    }
+
+    dst_iov.iov_base = send_wrapper->buf;
+    dst_iov.iov_len = (size_t)len;
+    raid_memcpy_iovs(&dst_iov, 1, 0, iov, iovcnt, iov_offset, len);
+    return 0;
+}
+
 static bool
 raidx_trace_layout_enabled(void)
 {
@@ -494,10 +511,12 @@ raidx_dispatch_to_rpc_recon_write(struct raidx_request_ctx *request_ctx, uint8_t
 
     cs_msg_init(cs_msg);
     if (iov != NULL && iov_len > 0) {
-        chunk_iovcnt = raidx_map_iov(cs_msg->sgl, iov, total_iovcnt, iov_offset, iov_len);
-        if (chunk_iovcnt < 0) {
-            return -EINVAL;
+        int ret = raidx_copy_payload_to_send_wrapper(send_wrapper, iov, total_iovcnt,
+                                                     iov_offset, iov_len);
+        if (ret != 0) {
+            return ret;
         }
+        chunk_iovcnt = 1;
     }
 
     cs_msg->type = RECON_RW_DIFF;
@@ -531,9 +550,11 @@ raidx_dispatch_to_rpc_recon_write(struct raidx_request_ctx *request_ctx, uint8_t
         cs_msg->coeff[i] = coeff[i];
     }
 
-    for (uint8_t i = 0; i < cs_msg->num_sge[0]; ++i) {
-        mr = (struct ibv_mr *)spdk_mem_map_translate(mem_map, cs_msg->sgl[i].addr, NULL);
-        cs_msg->sgl[i].rkey = mr->rkey;
+    if (chunk_iovcnt > 0) {
+        cs_msg->sgl[0].addr = (uint64_t)send_wrapper->buf;
+        cs_msg->sgl[0].len = (uint32_t)iov_len;
+        mr = (struct ibv_mr *)spdk_mem_map_translate(mem_map, cs_msg->sgl[0].addr, NULL);
+        cs_msg->sgl[0].rkey = mr->rkey;
     }
 
     sge->length = sizeof(struct cs_message_t) - sizeof(struct sg_entry) *
@@ -577,10 +598,12 @@ raidx_dispatch_to_rpc_partial(struct raidx_request_ctx *request_ctx, uint8_t chu
 
     cs_msg_init(cs_msg);
     if (iov != NULL && iov_len > 0) {
-        chunk_iovcnt = raidx_map_iov(cs_msg->sgl, iov, total_iovcnt, iov_offset, iov_len);
-        if (chunk_iovcnt < 0) {
-            return -EINVAL;
+        int ret = raidx_copy_payload_to_send_wrapper(send_wrapper, iov, total_iovcnt,
+                                                     iov_offset, iov_len);
+        if (ret != 0) {
+            return ret;
         }
+        chunk_iovcnt = 1;
     }
 
     cs_msg->type = cs_type;
@@ -609,9 +632,11 @@ raidx_dispatch_to_rpc_partial(struct raidx_request_ctx *request_ctx, uint8_t chu
         cs_msg->coeff[i] = coeff[i];
     }
 
-    for (uint8_t i = 0; i < cs_msg->num_sge[0]; ++i) {
-        mr = (struct ibv_mr *)spdk_mem_map_translate(mem_map, cs_msg->sgl[i].addr, NULL);
-        cs_msg->sgl[i].rkey = mr->rkey;
+    if (chunk_iovcnt > 0) {
+        cs_msg->sgl[0].addr = (uint64_t)send_wrapper->buf;
+        cs_msg->sgl[0].len = (uint32_t)iov_len;
+        mr = (struct ibv_mr *)spdk_mem_map_translate(mem_map, cs_msg->sgl[0].addr, NULL);
+        cs_msg->sgl[0].rkey = mr->rkey;
     }
 
     sge->length = sizeof(struct cs_message_t) - sizeof(struct sg_entry) *
@@ -988,7 +1013,7 @@ raidx_dispatch_partial_write(struct raidx_request_ctx *request_ctx, uint64_t str
                 ret = raidx_dispatch_to_rpc_partial(request_ctx, parity_chunk_idx,
                                                     parity_offset_blocks, chunk.req_blocks,
                                                     parity_offset_blocks, chunk.req_blocks,
-                                                    kReqTypeParity, PR_DIFF, 0,
+                                                    kReqTypeParity, PR_DIFF, chunk.data_index,
                                                     1, NULL, 0, 0, 0,
                                                     NULL, 0, &single_row, 1,
                                                     NULL, 0);

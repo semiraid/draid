@@ -15,6 +15,16 @@
 
 #include <rte_hash.h>
 #include <rte_memory.h>
+#include <unistd.h>
+
+static uint64_t g_raid6_request_group_id;
+
+static uint64_t
+raid6_next_request_group_id(void)
+{
+    uint64_t seq = __atomic_add_fetch(&g_raid6_request_group_id, 1, __ATOMIC_RELAXED);
+    return ((uint64_t)(uint32_t)getpid() << 32) | (seq & 0xffffffffULL);
+}
 
 /* The type of chunk request */
 enum chunk_request_type {
@@ -100,6 +110,9 @@ struct stripe_request {
     /* Counter for remaining chunk requests */
     int remaining;
 
+    /* Logical block count covered by this stripe request. */
+    uint64_t req_blocks;
+
     /* Status of the request */
     enum spdk_bdev_io_status status;
 
@@ -111,6 +124,9 @@ struct stripe_request {
 
     /* Initial iov_offset */
     uint64_t init_iov_offset;
+
+    /* Stable ID shared by all RPCs that belong to this stripe request. */
+    uint64_t request_group_id;
 
     /* First data chunk applicable to this request */
     struct chunk *first_data_chunk;
@@ -601,9 +617,8 @@ _raid6_submit_stripe_request(void *_stripe_req)
 }
 
 static void
-raid6_stripe_request_put(struct stripe_request *stripe_req)
+raid6_stripe_request_put(struct raid6_info *r6info, struct stripe_request *stripe_req)
 {
-    struct raid6_info *r6info = (struct raid6_info*) stripe_req->raid_io->raid_bdev->module_private;
     struct chunk *chunk;
 
     FOR_EACH_CHUNK(stripe_req, chunk) {
@@ -620,11 +635,13 @@ raid6_complete_stripe_request(struct stripe_request *stripe_req)
 {
     struct stripe *stripe = stripe_req->stripe;
     struct raid_bdev_io *raid_io = stripe_req->raid_io;
+    struct raid6_info *r6info = (struct raid6_info*) raid_io->raid_bdev->module_private;
+    struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(raid_io);
     enum spdk_bdev_io_status status = stripe_req->status;
     struct raid6_io_channel *r6ch = (struct raid6_io_channel*) raid_bdev_io_channel_get_resource(raid_io->raid_ch);
     struct stripe_request *next_req;
-    struct chunk *chunk;
     uint64_t req_blocks;
+    uint64_t completion_units;
 
     // Note: if next request available, submit it
     pthread_spin_lock(&stripe->requests_lock);
@@ -637,19 +654,17 @@ raid6_complete_stripe_request(struct stripe_request *stripe_req)
                              _raid6_submit_stripe_request, next_req);
     }
 
-    req_blocks = 0;
-    FOR_EACH_DATA_CHUNK(stripe_req, chunk) {
-        req_blocks += chunk->req_blocks;
-    }
+    req_blocks = stripe_req->req_blocks;
+    completion_units = bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE ? 1 : req_blocks;
 
-    raid6_stripe_request_put(stripe_req);
+    __atomic_fetch_sub(&stripe->refs, 1, __ATOMIC_SEQ_CST);
 
-    if (raid_bdev_io_complete_part(raid_io, req_blocks, status)) {
-        __atomic_fetch_sub(&stripe->refs, 1, __ATOMIC_SEQ_CST);
+    raid_bdev_io_complete_part(raid_io, completion_units, status);
 
-        if (!TAILQ_EMPTY(&r6ch->retry_queue)) {
-            raid6_io_channel_retry_request(r6ch);
-        }
+    raid6_stripe_request_put(r6info, stripe_req);
+
+    if (!TAILQ_EMPTY(&r6ch->retry_queue)) {
+        raid6_io_channel_retry_request(r6ch);
     }
 }
 
@@ -709,6 +724,8 @@ raid6_dispatch_to_rpc(struct raid6_info *r6info, uint8_t chunk_idx, uint64_t bas
     struct ibv_send_wr *send_wr = &send_wrapper->send_wr;
     struct ibv_sge *sge = send_wr->sg_list;
     struct cs_message_t *cs_msg = (struct cs_message_t *) sge->addr;
+    cs_msg_init(cs_msg);
+    cs_msg->request_group_id = stripe_req->request_group_id;
     cs_msg->type = cs_type;
     cs_msg->offset = base_offset_blocks;
     cs_msg->length = num_blocks;
@@ -970,6 +987,8 @@ raid6_dispatch_to_rpc_d_raid(struct raid6_info *r6info, uint8_t chunk_idx,
     struct ibv_send_wr *send_wr = &send_wrapper->send_wr;
     struct ibv_sge *sge = send_wr->sg_list;
     struct cs_message_t *cs_msg = (struct cs_message_t *) sge->addr;
+    cs_msg_init(cs_msg);
+    cs_msg->request_group_id = stripe_req->request_group_id;
     cs_msg->type = cs_type;
     cs_msg->data_index = data_index;
     cs_msg->offset = base_offset_blocks;
@@ -1235,6 +1254,8 @@ raid6_stripe_write_d_rcrmw_pro(struct stripe_request *stripe_req)
         send_wr = &send_wrapper->send_wr;
         sge = send_wr->sg_list;
         cs_msg = (struct cs_message_t *) sge->addr;
+        cs_msg_init(cs_msg);
+        cs_msg->request_group_id = stripe_req->request_group_id;
         mem_map = raid_ch->qp_group->qps[chunk->index]->mem_map;
         stripe_req->remaining++;
 
@@ -1857,24 +1878,6 @@ raid6_handle_stripe(struct raid_bdev_io *raid_io, struct stripe *stripe,
     uint8_t first_chunk_data_idx, last_chunk_data_idx;
     bool do_submit;
 
-    if (raid_io->base_bdev_io_remaining == blocks &&
-        bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE &&
-        blocks < raid_bdev->strip_size) {
-        /*
-         * Split in 2 smaller requests if this request would require
-         * a non-contiguous parity chunk update
-         */
-        uint64_t blocks_limit = raid_bdev->strip_size -
-                                (stripe_offset % raid_bdev->strip_size);
-        if (blocks > blocks_limit) {
-            raid6_handle_stripe(raid_io, stripe, stripe_offset,
-                                blocks_limit, iov_offset);
-            blocks -= blocks_limit;
-            stripe_offset += blocks_limit;
-            iov_offset += blocks_limit << raid_bdev->blocklen_shift;
-        }
-    }
-
     stripe_req = (struct stripe_request*) spdk_mempool_get(r6info->stripe_request_mempool);
     if (spdk_unlikely(!stripe_req)) {
         raid_bdev_io_complete_part(raid_io, blocks, SPDK_BDEV_IO_STATUS_NOMEM);
@@ -1884,8 +1887,10 @@ raid6_handle_stripe(struct raid_bdev_io *raid_io, struct stripe *stripe,
     stripe_req->raid_io = raid_io;
     stripe_req->iov_offset = iov_offset;
     stripe_req->init_iov_offset = iov_offset;
+    stripe_req->request_group_id = raid6_next_request_group_id();
     stripe_req->status = SPDK_BDEV_IO_STATUS_SUCCESS;
     stripe_req->remaining = 0;
+    stripe_req->req_blocks = blocks;
 
     stripe_req->stripe = stripe;
     uint8_t p_idx = raid_bdev->num_base_rpcs - 1 - (stripe->index % raid_bdev->num_base_rpcs);
@@ -2029,6 +2034,32 @@ _raid6_submit_rw_request(void *_raid_io)
     raid6_submit_rw_request(raid_io);
 }
 
+static uint64_t
+raid6_count_write_segments(struct raid_bdev *raid_bdev, struct raid6_info *r6info,
+                           uint64_t offset_blocks, uint64_t num_blocks)
+{
+    uint64_t segments = 0;
+    uint64_t blocks_left = num_blocks;
+    uint64_t cur_stripe_offset = offset_blocks % r6info->stripe_blocks;
+
+    while (blocks_left > 0) {
+        uint64_t blocks_this_segment = spdk_min(blocks_left,
+                                                r6info->stripe_blocks - cur_stripe_offset);
+        uint64_t blocks_this_chunk = raid_bdev->strip_size -
+                                     (cur_stripe_offset % raid_bdev->strip_size);
+
+        blocks_this_segment = spdk_min(blocks_this_segment, blocks_this_chunk);
+        blocks_left -= blocks_this_segment;
+        cur_stripe_offset += blocks_this_segment;
+        if (cur_stripe_offset == r6info->stripe_blocks) {
+            cur_stripe_offset = 0;
+        }
+        segments++;
+    }
+
+    return segments;
+}
+
 void
 raid6_complete_chunk_request_read(void *ctx)
 {
@@ -2113,12 +2144,14 @@ raid6_dispatch_to_rpc_read(struct raid_bdev_io *raid_io, uint8_t chunk_idx, uint
     struct ibv_send_wr *send_wr = &send_wrapper->send_wr;
     struct ibv_sge *sge = send_wr->sg_list;
     struct cs_message_t *cs_msg = (struct cs_message_t *) sge->addr;
+    cs_msg_init(cs_msg);
 
     int chunk_iovcnt = raid6_map_iov(cs_msg->sgl, iov, total_iovcnt, iov_offset, chunk_len);
 
     cs_msg->type = CS_RD;
     cs_msg->offset = base_offset_blocks;
     cs_msg->length = num_blocks;
+    cs_msg->request_group_id = raid6_next_request_group_id();
     cs_msg->last_index = raid_bdev->num_base_rpcs;
     cs_msg->num_sge[0] = (uint8_t) chunk_iovcnt;
     cs_msg->num_sge[1] = 0;
@@ -2141,14 +2174,15 @@ raid6_dispatch_to_rpc_read(struct raid_bdev_io *raid_io, uint8_t chunk_idx, uint
 }
 
 static void
-raid6_handle_read(struct raid_bdev_io *raid_io, uint64_t stripe_index, uint64_t stripe_offset, uint64_t blocks)
+raid6_handle_read(struct raid_bdev_io *raid_io, uint64_t stripe_index, uint64_t stripe_offset, uint64_t blocks,
+                  uint64_t iov_offset_base)
 {
     struct raid_bdev *raid_bdev = raid_io->raid_bdev;
     struct raid6_io_channel *r6ch = (struct raid6_io_channel*) raid_bdev_io_channel_get_resource(raid_io->raid_ch);
     struct spdk_bdev_io *bdev_io = spdk_bdev_io_from_ctx(raid_io);
     struct iovec *iov = bdev_io->u.bdev.iovs;
     int iovcnt = bdev_io->u.bdev.iovcnt;
-    uint64_t iov_offset = 0;
+    uint64_t iov_offset = iov_offset_base;
 
     uint64_t chunk_offset_from, chunk_offset_to, chunk_req_offset, chunk_req_blocks, chunk_len;
     int chunk_iovcnt;
@@ -2228,27 +2262,87 @@ raid6_submit_rw_request(struct raid_bdev_io *raid_io)
     uint64_t stripe_index = offset_blocks / r6info->stripe_blocks;
     uint64_t stripe_offset = offset_blocks % r6info->stripe_blocks;
     struct stripe *stripe;
+    uint64_t completion_units_left;
 
     if (!raid_bdev->degraded && bdev_io->type == SPDK_BDEV_IO_TYPE_READ) {
         raid_io->base_bdev_io_remaining = num_blocks;
-        raid6_handle_read(raid_io, stripe_index, stripe_offset, num_blocks);
+        uint64_t blocks_left = num_blocks;
+        uint64_t read_stripe_index = stripe_index;
+        uint64_t read_stripe_offset = stripe_offset;
+        uint64_t iov_offset = 0;
+
+        while (blocks_left > 0) {
+            uint64_t blocks_this_stripe = spdk_min(blocks_left,
+                                                   r6info->stripe_blocks - read_stripe_offset);
+
+            raid6_handle_read(raid_io, read_stripe_index, read_stripe_offset,
+                              blocks_this_stripe,
+                              iov_offset << raid_bdev->blocklen_shift);
+
+            blocks_left -= blocks_this_stripe;
+            iov_offset += blocks_this_stripe;
+            read_stripe_index++;
+            read_stripe_offset = 0;
+        }
         return;
     }
 
-    stripe = raid6_get_stripe(r6info, stripe_index);
-    if (spdk_unlikely(stripe == NULL)) {
-        struct raid6_io_channel *r6ch = (struct raid6_io_channel*) raid_bdev_io_channel_get_resource(raid_io->raid_ch);
-        struct spdk_bdev_io_wait_entry *wqe = &raid_io->waitq_entry;
-
-        wqe->cb_fn = _raid6_submit_rw_request;
-        wqe->cb_arg = raid_io;
-        TAILQ_INSERT_TAIL(&r6ch->retry_queue, wqe, link);
-        return;
+    if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) {
+        completion_units_left = raid6_count_write_segments(raid_bdev, r6info,
+                                                           offset_blocks, num_blocks);
+    } else {
+        completion_units_left = num_blocks;
     }
+    raid_io->base_bdev_io_remaining = completion_units_left;
 
-    raid_io->base_bdev_io_remaining = num_blocks;
+    uint64_t blocks_left = num_blocks;
+    uint64_t cur_stripe_index = stripe_index;
+    uint64_t cur_stripe_offset = stripe_offset;
+    uint64_t iov_offset = 0;
 
-    raid6_handle_stripe(raid_io, stripe, stripe_offset, num_blocks, 0);
+    while (blocks_left > 0) {
+        uint64_t blocks_this_stripe = spdk_min(blocks_left,
+                                               r6info->stripe_blocks - cur_stripe_offset);
+
+        if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) {
+            uint64_t blocks_this_chunk = raid_bdev->strip_size -
+                                         (cur_stripe_offset % raid_bdev->strip_size);
+            blocks_this_stripe = spdk_min(blocks_this_stripe, blocks_this_chunk);
+        }
+
+        stripe = raid6_get_stripe(r6info, cur_stripe_index);
+        if (spdk_unlikely(stripe == NULL)) {
+            if (iov_offset == 0) {
+                struct raid6_io_channel *r6ch = (struct raid6_io_channel*) raid_bdev_io_channel_get_resource(raid_io->raid_ch);
+                struct spdk_bdev_io_wait_entry *wqe = &raid_io->waitq_entry;
+
+                wqe->cb_fn = _raid6_submit_rw_request;
+                wqe->cb_arg = raid_io;
+                TAILQ_INSERT_TAIL(&r6ch->retry_queue, wqe, link);
+            } else {
+                raid_bdev_io_complete_part(raid_io,
+                                           bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE ?
+                                           completion_units_left : blocks_left,
+                                           SPDK_BDEV_IO_STATUS_NOMEM);
+            }
+            return;
+        }
+
+        raid6_handle_stripe(raid_io, stripe, cur_stripe_offset,
+                            blocks_this_stripe,
+                            iov_offset << raid_bdev->blocklen_shift);
+
+        blocks_left -= blocks_this_stripe;
+        iov_offset += blocks_this_stripe;
+        if (bdev_io->type == SPDK_BDEV_IO_TYPE_WRITE) {
+            completion_units_left--;
+        }
+        cur_stripe_offset += blocks_this_stripe;
+        if (cur_stripe_offset == r6info->stripe_blocks) {
+            cur_stripe_index++;
+            cur_stripe_offset = 0;
+        }
+    }
 }
 
 static int
@@ -2270,8 +2364,10 @@ raid6_stripe_init(struct stripe *stripe, struct raid_bdev *raid_bdev)
             SPDK_ERRLOG("Failed to allocate chunk buffer\n");
             for (i = i - 1; i >= 0; i--) {
                 spdk_dma_free(stripe->chunk_buffers[i]);
+                stripe->chunk_buffers[i] = NULL;
             }
             free(stripe->chunk_buffers);
+            stripe->chunk_buffers = NULL;
             return -ENOMEM;
         }
         stripe->chunk_buffers[i] = buf;
@@ -2288,10 +2384,18 @@ raid6_stripe_deinit(struct stripe *stripe, struct raid_bdev *raid_bdev)
 {
     uint8_t i;
 
+    if (stripe->chunk_buffers == NULL) {
+        return;
+    }
+
     for (i = 0; i < 3; i++) {
-        spdk_dma_free(stripe->chunk_buffers[i]);
+        if (stripe->chunk_buffers[i] != NULL) {
+            spdk_dma_free(stripe->chunk_buffers[i]);
+            stripe->chunk_buffers[i] = NULL;
+        }
     }
     free(stripe->chunk_buffers);
+    stripe->chunk_buffers = NULL;
 
     pthread_spin_destroy(&stripe->requests_lock);
 }
@@ -2399,18 +2503,19 @@ raid6_start(struct raid_bdev *raid_bdev)
 
     TAILQ_INIT(&r6info->free_stripes);
 
-    for (i = 0; i < RAID_MAX_STRIPES; i++) {
-        struct stripe *stripe = &r6info->stripes[i];
+	    for (i = 0; i < RAID_MAX_STRIPES; i++) {
+	        struct stripe *stripe = &r6info->stripes[i];
 
-        ret = raid6_stripe_init(stripe, raid_bdev);
-        if (ret) {
-            for (; i > 0; --i) {
-                raid6_stripe_deinit(&r6info->stripes[i], raid_bdev);
-            }
-            free(r6info->stripes);
-            r6info->stripes = NULL;
-            goto out;
-        }
+	        ret = raid6_stripe_init(stripe, raid_bdev);
+	        if (ret) {
+	            while (i > 0) {
+	                --i;
+	                raid6_stripe_deinit(&r6info->stripes[i], raid_bdev);
+	            }
+	            free(r6info->stripes);
+	            r6info->stripes = NULL;
+	            goto out;
+	        }
 
         TAILQ_INSERT_TAIL(&r6info->free_stripes, stripe, link);
     }
