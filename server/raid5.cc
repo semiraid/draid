@@ -18,14 +18,24 @@ static struct rdma_qp_server *g_host_qp_list; // global host QP list
 static struct rdma_qp_server *g_server_qp_list; // global server QP list
 
 static struct spdk_poller *g_poller;
+static uint64_t g_raid5_recv_post_retry_logs = 0;
+static uint64_t g_raid5_send_post_retry_logs = 0;
 
 static int host_qp_send_wr_budget();
 static int peer_qp_send_wr_budget();
 static int peer_qp_recv_wr_budget();
+static int host_qp_recv_wr_budget();
 static int server_cq_entries();
 static uint32_t raid5_queue_depth();
 static void raid5_load_queue_depth_from_env();
 static size_t raid5_send_wr_chain_count(struct ibv_send_wr *first, struct ibv_send_wr **last);
+
+static bool
+raid5_should_log_wr_retry(uint64_t *counter)
+{
+    (*counter)++;
+    return *counter <= 16 || (*counter & (*counter - 1)) == 0;
+}
 
 static uint32_t
 raid5_queue_depth()
@@ -376,6 +386,13 @@ rdma_send_msg(struct send_wr_wrapper_server *send_wrapper, struct recv_wr_wrappe
             assert(false);
     }
 
+    /*
+     * Peer SENDs must be signaled so their SQ entries are reclaimed, but the
+     * foreground state machine is advanced by the peer callback, not by the
+     * local SEND completion.
+     */
+    send_wrapper->await_callback = true;
+    send_wr->send_flags = IBV_SEND_SIGNALED;
     send_wr->next = NULL;
     if (rqp->send_wrs.first == NULL) {
         rqp->send_wrs.first = send_wr;
@@ -391,6 +408,7 @@ void
 rdma_send_resp(struct send_wr_wrapper_server *send_wrapper, uint64_t req_id, uint64_t request_group_id)
 {
     struct rdma_qp_server *rqp = send_wrapper->rqp;
+    send_wrapper->await_callback = false;
     send_wrapper->cs_resp->req_id = req_id;
     send_wrapper->cs_resp->request_group_id = request_group_id;
     struct ibv_send_wr *send_wr = &send_wrapper->send_wr;
@@ -1225,7 +1243,10 @@ req_handler_callback(struct recv_wr_wrapper_server *recv_wrapper)
     struct cs_resp_t *cs_resp = recv_wrapper->cs_resp;
     struct send_wr_wrapper_server *send_wrapper_release = (struct send_wr_wrapper_server *) cs_resp->req_id;
     struct recv_wr_wrapper_server *recv_wrapper_release = send_wrapper_release->ctx;
-    run_state_machine(recv_wrapper_release,CALLBACK);
+    if (recv_wrapper_release != NULL) {
+        run_state_machine(recv_wrapper_release,CALLBACK);
+    }
+    send_wrapper_release->await_callback = false;
     TAILQ_INSERT_TAIL(&send_wrapper_release->rqp->free_send, send_wrapper_release, link);
     rdma_recv(recv_wrapper);
 }
@@ -1243,6 +1264,7 @@ poll_cq(void *arg)
     int i, ret;
     uint64_t id;
     struct rdma_qp_server *rqp;
+    bool retry_pending = false;
 
     int num_cqe = ibv_poll_cq(g_cq, batch_size, wc);
 
@@ -1255,6 +1277,9 @@ poll_cq(void *arg)
         switch (wc[i].opcode) {
             case IBV_WC_SEND:
                 send_wrapper = (struct send_wr_wrapper_server *) id;
+                if (send_wrapper->await_callback) {
+                    break;
+                }
                 if (send_wrapper->ctx != NULL) {
                     run_state_machine(send_wrapper->ctx, RDMA_SEND_COMPLETE);
                 }
@@ -1305,33 +1330,44 @@ poll_cq(void *arg)
             if (spdk_unlikely(ret)) {
                 struct ibv_recv_wr *retry_last = NULL;
 
-                SPDK_ERRLOG("post recv failed rc=%d errno=%d (%s) pending_recv=%zu "
-                            "bad_wr=%p qp=%p; retry pending recvs\n",
-                            ret, errno, strerror(errno), rqp->recv_wrs.size,
-                            (void *)bad_recv_wr,
-                            rqp->cmd_cm_id != NULL ? (void *)rqp->cmd_cm_id->qp : NULL);
-                if (bad_recv_wr != NULL) {
+                if (raid5_should_log_wr_retry(&g_raid5_recv_post_retry_logs)) {
+                    SPDK_ERRLOG("post recv failed rc=%d errno=%d (%s) pending_recv=%zu "
+                                "bad_wr=%p qp=%p; drop duplicate/resource recv tail\n",
+                                ret, errno, strerror(errno), rqp->recv_wrs.size,
+                                (void *)bad_recv_wr,
+                                rqp->cmd_cm_id != NULL ? (void *)rqp->cmd_cm_id->qp : NULL);
+                }
+                if (ret == ENOMEM || errno == EAGAIN) {
+                    rqp->recv_wrs.first = NULL;
+                    rqp->recv_wrs.last = NULL;
+                    rqp->recv_wrs.size = 0;
+                } else if (bad_recv_wr != NULL) {
                     rqp->recv_wrs.first = bad_recv_wr;
                     rqp->recv_wrs.size = raid5_recv_wr_chain_count(bad_recv_wr, &retry_last);
                     rqp->recv_wrs.last = retry_last;
+                    retry_pending = true;
+                } else {
+                    retry_pending = true;
                 }
-                return SPDK_POLLER_BUSY;
+            } else {
+                num_cqe += rqp->recv_wrs.size;
+                rqp->recv_wrs.first = NULL;
+                rqp->recv_wrs.last = NULL;
+                rqp->recv_wrs.size = 0;
             }
-            num_cqe += rqp->recv_wrs.size;
-            rqp->recv_wrs.first = NULL;
-            rqp->recv_wrs.last = NULL;
-            rqp->recv_wrs.size = 0;
         }
         if (rqp->send_wrs.first != NULL) {
             ret = ibv_post_send(rqp->cmd_cm_id->qp, rqp->send_wrs.first, &bad_send_wr);
             if (spdk_unlikely(ret)) {
                 struct ibv_send_wr *retry_last = NULL;
 
-                SPDK_ERRLOG("post send failed rc=%d errno=%d (%s) pending_send=%zu "
-                            "bad_wr=%p qp=%p; retry pending sends\n",
-                            ret, errno, strerror(errno), rqp->send_wrs.size,
-                            (void *)bad_send_wr,
-                            rqp->cmd_cm_id != NULL ? (void *)rqp->cmd_cm_id->qp : NULL);
+                if (raid5_should_log_wr_retry(&g_raid5_send_post_retry_logs)) {
+                    SPDK_ERRLOG("post send failed rc=%d errno=%d (%s) pending_send=%zu "
+                                "bad_wr=%p qp=%p; retry pending sends\n",
+                                ret, errno, strerror(errno), rqp->send_wrs.size,
+                                (void *)bad_send_wr,
+                                rqp->cmd_cm_id != NULL ? (void *)rqp->cmd_cm_id->qp : NULL);
+                }
                 if (bad_send_wr != NULL) {
                     rqp->send_wrs.first = bad_send_wr;
                     rqp->send_wrs.size = raid5_send_wr_chain_count(bad_send_wr, &retry_last);
@@ -1356,33 +1392,44 @@ poll_cq(void *arg)
             if (spdk_unlikely(ret)) {
                 struct ibv_recv_wr *retry_last = NULL;
 
-                SPDK_ERRLOG("post recv failed rc=%d errno=%d (%s) pending_recv=%zu "
-                            "bad_wr=%p qp=%p; retry pending recvs\n",
-                            ret, errno, strerror(errno), rqp->recv_wrs.size,
-                            (void *)bad_recv_wr,
-                            rqp->cmd_cm_id != NULL ? (void *)rqp->cmd_cm_id->qp : NULL);
-                if (bad_recv_wr != NULL) {
+                if (raid5_should_log_wr_retry(&g_raid5_recv_post_retry_logs)) {
+                    SPDK_ERRLOG("post recv failed rc=%d errno=%d (%s) pending_recv=%zu "
+                                "bad_wr=%p qp=%p; drop duplicate/resource recv tail\n",
+                                ret, errno, strerror(errno), rqp->recv_wrs.size,
+                                (void *)bad_recv_wr,
+                                rqp->cmd_cm_id != NULL ? (void *)rqp->cmd_cm_id->qp : NULL);
+                }
+                if (ret == ENOMEM || errno == EAGAIN) {
+                    rqp->recv_wrs.first = NULL;
+                    rqp->recv_wrs.last = NULL;
+                    rqp->recv_wrs.size = 0;
+                } else if (bad_recv_wr != NULL) {
                     rqp->recv_wrs.first = bad_recv_wr;
                     rqp->recv_wrs.size = raid5_recv_wr_chain_count(bad_recv_wr, &retry_last);
                     rqp->recv_wrs.last = retry_last;
+                    retry_pending = true;
+                } else {
+                    retry_pending = true;
                 }
-                return SPDK_POLLER_BUSY;
+            } else {
+                num_cqe += rqp->recv_wrs.size;
+                rqp->recv_wrs.first = NULL;
+                rqp->recv_wrs.last = NULL;
+                rqp->recv_wrs.size = 0;
             }
-            num_cqe += rqp->recv_wrs.size;
-            rqp->recv_wrs.first = NULL;
-            rqp->recv_wrs.last = NULL;
-            rqp->recv_wrs.size = 0;
         }
         if (rqp->send_wrs.first != NULL) {
             ret = ibv_post_send(rqp->cmd_cm_id->qp, rqp->send_wrs.first, &bad_send_wr);
             if (spdk_unlikely(ret)) {
                 struct ibv_send_wr *retry_last = NULL;
 
-                SPDK_ERRLOG("post send failed rc=%d errno=%d (%s) pending_send=%zu "
-                            "bad_wr=%p qp=%p; retry pending sends\n",
-                            ret, errno, strerror(errno), rqp->send_wrs.size,
-                            (void *)bad_send_wr,
-                            rqp->cmd_cm_id != NULL ? (void *)rqp->cmd_cm_id->qp : NULL);
+                if (raid5_should_log_wr_retry(&g_raid5_send_post_retry_logs)) {
+                    SPDK_ERRLOG("post send failed rc=%d errno=%d (%s) pending_send=%zu "
+                                "bad_wr=%p qp=%p; retry pending sends\n",
+                                ret, errno, strerror(errno), rqp->send_wrs.size,
+                                (void *)bad_send_wr,
+                                rqp->cmd_cm_id != NULL ? (void *)rqp->cmd_cm_id->qp : NULL);
+                }
                 if (bad_send_wr != NULL) {
                     rqp->send_wrs.first = bad_send_wr;
                     rqp->send_wrs.size = raid5_send_wr_chain_count(bad_send_wr, &retry_last);
@@ -1397,7 +1444,7 @@ poll_cq(void *arg)
         }
     }
 
-    return num_cqe > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
+    return num_cqe > 0 || retry_pending ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
 }
 
 void
@@ -1936,7 +1983,7 @@ connect_rdma_connections(void)
 
         qp_attr.cap.max_send_wr = host_qp_send_wr_budget();
         qp_attr.cap.max_send_sge = 1;
-        qp_attr.cap.max_recv_wr = raid5_queue_depth();
+        qp_attr.cap.max_recv_wr = host_qp_recv_wr_budget();
         qp_attr.cap.max_recv_sge = 1;
         qp_attr.send_cq = g_cq;
         qp_attr.recv_cq = g_cq;
@@ -2125,6 +2172,12 @@ host_qp_send_wr_budget()
 }
 
 static int
+host_qp_recv_wr_budget()
+{
+    return spdk_min((int)raid5_queue_depth() * 2, 4096);
+}
+
+static int
 peer_qp_send_wr_budget()
 {
     /*
@@ -2141,7 +2194,7 @@ peer_qp_send_wr_budget()
 static int
 peer_qp_recv_wr_budget()
 {
-    return raid5_queue_depth() * g_num_qp;
+    return spdk_min((int)raid5_queue_depth() * g_num_qp * 2, 4096);
 }
 
 static int
@@ -2153,7 +2206,7 @@ server_cq_entries()
      * completion 侧仍然可能先耗尽。
      */
     const int host_send_wr = host_qp_send_wr_budget();
-    const int host_recv_wr = raid5_queue_depth();
+    const int host_recv_wr = host_qp_recv_wr_budget();
     const int peer_send_wr = peer_qp_send_wr_budget();
     const int peer_recv_wr = peer_qp_recv_wr_budget();
     const int peer_qp_count = spdk_max(g_numOfServers - 1, 0);
