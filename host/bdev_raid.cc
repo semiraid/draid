@@ -199,23 +199,36 @@ req_handler_rdma(struct cs_resp_t *cs_resp) {
     struct send_wr_wrapper *send_wrapper = (struct send_wr_wrapper *) cs_resp->req_id;
 
     if (spdk_unlikely(cs_resp->request_group_id != send_wrapper->request_group_id)) {
-        SPDK_ERRLOG("ignore stale dRAID callback req_id=%p resp_group=%" PRIu64 " current_group=%" PRIu64 "\n",
-                    send_wrapper, cs_resp->request_group_id, send_wrapper->request_group_id);
+        SPDK_ERRLOG("ignore stale dRAID callback req_id=%p type=%u resp_group=%" PRIu64
+                    " current_group=%" PRIu64 " expected=%u remaining=%u send_done=%d callback_done=%d\n",
+                    send_wrapper, send_wrapper->msg_type, cs_resp->request_group_id,
+                    send_wrapper->request_group_id, send_wrapper->expected_rtn_cnt,
+                    send_wrapper->rtn_cnt, send_wrapper->send_done,
+                    send_wrapper->callback_done);
         return;
     }
     if (spdk_unlikely(send_wrapper->expected_rtn_cnt == 0)) {
-        SPDK_ERRLOG("ignore unexpected dRAID callback for zero-response req_id=%p group=%" PRIu64 "\n",
-                    send_wrapper, send_wrapper->request_group_id);
+        SPDK_ERRLOG("ignore unexpected dRAID callback for zero-response req_id=%p type=%u group=%" PRIu64
+                    " remaining=%u send_done=%d callback_done=%d\n",
+                    send_wrapper, send_wrapper->msg_type, send_wrapper->request_group_id,
+                    send_wrapper->rtn_cnt, send_wrapper->send_done,
+                    send_wrapper->callback_done);
         return;
     }
     if (spdk_unlikely(send_wrapper->callback_done)) {
-        SPDK_ERRLOG("ignore duplicate dRAID callback req_id=%p group=%" PRIu64 "\n",
-                    send_wrapper, send_wrapper->request_group_id);
+        SPDK_ERRLOG("ignore duplicate dRAID callback req_id=%p type=%u group=%" PRIu64
+                    " expected=%u remaining=%u send_done=%d\n",
+                    send_wrapper, send_wrapper->msg_type, send_wrapper->request_group_id,
+                    send_wrapper->expected_rtn_cnt, send_wrapper->rtn_cnt,
+                    send_wrapper->send_done);
         return;
     }
     if (spdk_unlikely(send_wrapper->rtn_cnt == 0)) {
-        SPDK_ERRLOG("ignore unexpected dRAID callback req_id=%p group=%" PRIu64 "\n",
-                    send_wrapper, send_wrapper->request_group_id);
+        SPDK_ERRLOG("ignore unexpected dRAID callback req_id=%p type=%u group=%" PRIu64
+                    " expected=%u send_done=%d callback_done=%d\n",
+                    send_wrapper, send_wrapper->msg_type, send_wrapper->request_group_id,
+                    send_wrapper->expected_rtn_cnt, send_wrapper->send_done,
+                    send_wrapper->callback_done);
         return;
     }
     if (--send_wrapper->rtn_cnt == 0) {
@@ -245,6 +258,15 @@ raid_poll_qp(void *arg)
     struct raid_bdev_io_channel *raid_ch = (struct raid_bdev_io_channel*) arg;
     uint8_t num_rpcs = raid_ch->num_rpcs;
     int total_cqe = 0;
+    int poll_rc = SPDK_POLLER_IDLE;
+
+    if (spdk_unlikely(raid_ch->qp_group == NULL)) {
+        return SPDK_POLLER_IDLE;
+    }
+
+    if (spdk_unlikely(pthread_spin_trylock(&raid_ch->qp_group->poll_lock) != 0)) {
+        return SPDK_POLLER_BUSY;
+    }
 
     do {
         num_cqe = ibv_poll_cq(raid_ch->qp_group->cq, batch_size, wc);
@@ -315,7 +337,8 @@ raid_poll_qp(void *arg)
                     rqp->send_wrs.size = raid_send_wr_chain_count(bad_send_wr, &retry_last);
                     rqp->send_wrs.last = retry_last;
                 }
-                return SPDK_POLLER_BUSY;
+                poll_rc = SPDK_POLLER_BUSY;
+                goto out;
             }
             rqp->send_wrs.first = NULL;
             rqp->send_wrs.last = NULL;
@@ -323,7 +346,11 @@ raid_poll_qp(void *arg)
         }
     }
 
-    return total_cqe > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
+    poll_rc = total_cqe > 0 ? SPDK_POLLER_BUSY : SPDK_POLLER_IDLE;
+
+out:
+    pthread_spin_unlock(&raid_ch->qp_group->poll_lock);
+    return poll_rc;
 }
 
 /*
@@ -980,6 +1007,7 @@ setup_rdma(struct raid_bdev *raid_bdev, struct raid_bdev_config *raid_cfg)
         // CQ 延迟创建：在第一个 rdma_resolve_addr 完成后，用 cm_id->verbs（实际选中的
         // RDMA 设备）创建 CQ，避免与硬编码的 get_phy_port() 索引不一致导致设备错配。
         r_qp_group->cq = NULL;
+        pthread_spin_init(&r_qp_group->poll_lock, PTHREAD_PROCESS_PRIVATE);
 
         for (uint8_t i = 0; i < raid_bdev->num_base_rpcs; i++) {
 
@@ -1327,6 +1355,7 @@ raid_dispatch_to_rpc(struct send_wr_wrapper *send_wrapper)
 
     send_wrapper->request_group_id = cs_msg->request_group_id;
     send_wrapper->expected_rtn_cnt = send_wrapper->rtn_cnt;
+    send_wrapper->msg_type = cs_msg->type;
     send_wrapper->send_done = false;
     send_wrapper->callback_done = false;
     send_wr->next = NULL;

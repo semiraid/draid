@@ -36,6 +36,7 @@ struct send_wr_wrapper {
     uint64_t request_group_id;
     uint8_t rtn_cnt;
     uint8_t expected_rtn_cnt;
+    uint8_t msg_type;
     bool send_done;
     bool callback_done;
     void *buf;
@@ -50,6 +51,7 @@ struct recv_wr_wrapper {
 struct rdma_qp_group {
     struct rdma_qp **qps;
     struct ibv_cq *cq;
+    pthread_spinlock_t poll_lock;
     TAILQ_ENTRY(rdma_qp_group) link;
 };
 

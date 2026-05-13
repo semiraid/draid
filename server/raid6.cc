@@ -135,6 +135,20 @@ raid6_recv_wr_chain_count(struct ibv_recv_wr *first, struct ibv_recv_wr **last)
     return count;
 }
 
+static void
+raid6_mark_recv_chain(struct ibv_recv_wr *first, struct ibv_recv_wr *stop,
+                      bool queued, bool posted)
+{
+    struct ibv_recv_wr *wr;
+
+    for (wr = first; wr != NULL && wr != stop; wr = wr->next) {
+        struct recv_wr_wrapper_server *recv_wrapper =
+            (struct recv_wr_wrapper_server *)wr->wr_id;
+        recv_wrapper->recv_queued = queued;
+        recv_wrapper->recv_posted = posted;
+    }
+}
+
 static uint32_t
 raid6_host_send_wr_budget(void)
 {
@@ -892,7 +906,12 @@ rdma_recv(struct recv_wr_wrapper_server *recv_wrapper)
     struct rdma_qp_server *rqp = recv_wrapper->rqp;
     struct ibv_recv_wr *recv_wr = &recv_wrapper->recv_wr;
 
+    if (spdk_unlikely(recv_wrapper->recv_queued || recv_wrapper->recv_posted)) {
+        return;
+    }
+
     recv_wr->next = NULL;
+    recv_wrapper->recv_queued = true;
     if (rqp->recv_wrs.first == NULL) {
         rqp->recv_wrs.first = recv_wr;
         rqp->recv_wrs.last = recv_wr;
@@ -2384,6 +2403,9 @@ poll_cq(void *arg)
                 break;
             case IBV_WC_RECV:
                 recv_wrapper = (struct recv_wr_wrapper_server *) id;
+                recv_wrapper->recv_posted = false;
+                recv_wrapper->recv_queued = false;
+                recv_wrapper->recv_wr.next = NULL;
                 msg_type = wc[i].imm_data;
                 switch (msg_type) {
                     case kReqTypeRW:
@@ -2418,31 +2440,28 @@ poll_cq(void *arg)
     for (i = 0; i < g_num_qp; i++) {
         rqp = &g_host_qp_list[i];
         if (rqp->recv_wrs.first != NULL) {
+            struct ibv_recv_wr *first_recv_wr = rqp->recv_wrs.first;
             ret = ibv_post_recv(rqp->cmd_cm_id->qp, rqp->recv_wrs.first, &bad_recv_wr);
             if (spdk_unlikely(ret)) {
                 struct ibv_recv_wr *retry_last = NULL;
 
                 if (raid6_should_log_wr_retry(&g_raid6_recv_post_retry_logs)) {
                     SPDK_ERRLOG("post recv failed rc=%d errno=%d (%s) pending_recv=%zu "
-                                "bad_wr=%p qp=%p; drop duplicate/resource recv tail\n",
+                                "bad_wr=%p qp=%p; retry pending receives\n",
                                 ret, errno, strerror(errno), rqp->recv_wrs.size,
                                 (void *)bad_recv_wr,
                                 rqp->cmd_cm_id != NULL ? (void *)rqp->cmd_cm_id->qp : NULL);
                 }
-                if (ret == ENOMEM || errno == EAGAIN) {
-                    rqp->recv_wrs.first = NULL;
-                    rqp->recv_wrs.last = NULL;
-                    rqp->recv_wrs.size = 0;
-                } else if (bad_recv_wr != NULL) {
+                if (bad_recv_wr != NULL) {
+                    raid6_mark_recv_chain(first_recv_wr, bad_recv_wr, false, true);
                     rqp->recv_wrs.first = bad_recv_wr;
                     rqp->recv_wrs.size = raid6_recv_wr_chain_count(bad_recv_wr, &retry_last);
                     rqp->recv_wrs.last = retry_last;
-                    retry_pending = true;
-                } else {
-                    retry_pending = true;
                 }
+                retry_pending = true;
             } else {
                 num_cqe += rqp->recv_wrs.size;
+                raid6_mark_recv_chain(rqp->recv_wrs.first, NULL, false, true);
                 rqp->recv_wrs.first = NULL;
                 rqp->recv_wrs.last = NULL;
                 rqp->recv_wrs.size = 0;
@@ -2479,31 +2498,28 @@ poll_cq(void *arg)
         }
         rqp = &g_server_qp_list[i];
         if (rqp->recv_wrs.first != NULL) {
+            struct ibv_recv_wr *first_recv_wr = rqp->recv_wrs.first;
             ret = ibv_post_recv(rqp->cmd_cm_id->qp, rqp->recv_wrs.first, &bad_recv_wr);
             if (spdk_unlikely(ret)) {
                 struct ibv_recv_wr *retry_last = NULL;
 
                 if (raid6_should_log_wr_retry(&g_raid6_recv_post_retry_logs)) {
                     SPDK_ERRLOG("post recv failed rc=%d errno=%d (%s) pending_recv=%zu "
-                                "bad_wr=%p qp=%p; drop duplicate/resource recv tail\n",
+                                "bad_wr=%p qp=%p; retry pending receives\n",
                                 ret, errno, strerror(errno), rqp->recv_wrs.size,
                                 (void *)bad_recv_wr,
                                 rqp->cmd_cm_id != NULL ? (void *)rqp->cmd_cm_id->qp : NULL);
                 }
-                if (ret == ENOMEM || errno == EAGAIN) {
-                    rqp->recv_wrs.first = NULL;
-                    rqp->recv_wrs.last = NULL;
-                    rqp->recv_wrs.size = 0;
-                } else if (bad_recv_wr != NULL) {
+                if (bad_recv_wr != NULL) {
+                    raid6_mark_recv_chain(first_recv_wr, bad_recv_wr, false, true);
                     rqp->recv_wrs.first = bad_recv_wr;
                     rqp->recv_wrs.size = raid6_recv_wr_chain_count(bad_recv_wr, &retry_last);
                     rqp->recv_wrs.last = retry_last;
-                    retry_pending = true;
-                } else {
-                    retry_pending = true;
                 }
+                retry_pending = true;
             } else {
                 num_cqe += rqp->recv_wrs.size;
+                raid6_mark_recv_chain(rqp->recv_wrs.first, NULL, false, true);
                 rqp->recv_wrs.first = NULL;
                 rqp->recv_wrs.last = NULL;
                 rqp->recv_wrs.size = 0;
@@ -2937,7 +2953,10 @@ connect_rdma_connections(void)
             SPDK_ERRLOG("post send failed\n");
             assert(false);
         }
+        raid6_mark_recv_chain(g_server_qp_list[i].recv_wrs.first, NULL, false, true);
         g_server_qp_list[i].recv_wrs.first = NULL;
+        g_server_qp_list[i].recv_wrs.last = NULL;
+        g_server_qp_list[i].recv_wrs.size = 0;
 
         ret = rdma_connect(svr_cmd_cm_id_list[i], &conn_param);
         if(ret) {
@@ -3017,7 +3036,10 @@ connect_rdma_connections(void)
             SPDK_ERRLOG("post send failed\n");
             assert(false);
         }
+        raid6_mark_recv_chain(g_server_qp_list[i].recv_wrs.first, NULL, false, true);
         g_server_qp_list[i].recv_wrs.first = NULL;
+        g_server_qp_list[i].recv_wrs.last = NULL;
+        g_server_qp_list[i].recv_wrs.size = 0;
 
         ret = rdma_accept(g_server_qp_list[i].cmd_cm_id, &conn_param);
         if(ret) {
@@ -3108,7 +3130,10 @@ connect_rdma_connections(void)
             SPDK_ERRLOG("post send failed\n");
             assert(false);
         }
+        raid6_mark_recv_chain(g_host_qp_list[i].recv_wrs.first, NULL, false, true);
         g_host_qp_list[i].recv_wrs.first = NULL;
+        g_host_qp_list[i].recv_wrs.last = NULL;
+        g_host_qp_list[i].recv_wrs.size = 0;
 
         ret = rdma_accept(g_host_qp_list[i].cmd_cm_id, &conn_param);
         if(ret) {

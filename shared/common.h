@@ -180,6 +180,8 @@ struct recv_wr_wrapper_server {
     struct cs_message_t *cs_msg;
     struct cs_resp_t *cs_resp;
     struct bdev_context_t *bdev_context;
+    bool recv_queued;
+    bool recv_posted;
 };
 
 static constexpr uint64_t kMaxBlockcnt = 1024ULL * 1024ULL * 1024ULL;
