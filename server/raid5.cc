@@ -387,11 +387,13 @@ rdma_send_msg(struct send_wr_wrapper_server *send_wrapper, struct recv_wr_wrappe
     }
 
     /*
-     * Peer SENDs must be signaled so their SQ entries are reclaimed, but the
-     * foreground state machine is advanced by the peer callback, not by the
-     * local SEND completion.
+     * Peer SENDs are complete only after both the local SEND completion and
+     * the peer callback arrive. The two events can be observed in either
+     * order, so the wrapper must not return to free_send until both have fired.
      */
     send_wrapper->await_callback = true;
+    send_wrapper->send_done = false;
+    send_wrapper->callback_done = false;
     send_wr->send_flags = IBV_SEND_SIGNALED;
     send_wr->next = NULL;
     if (rqp->send_wrs.first == NULL) {
@@ -404,11 +406,23 @@ rdma_send_msg(struct send_wr_wrapper_server *send_wrapper, struct recv_wr_wrappe
     rqp->send_wrs.size++;
 }
 
+static void
+raid5_free_send_wrapper_if_peer_done(struct send_wr_wrapper_server *send_wrapper)
+{
+    if (send_wrapper->send_done && send_wrapper->callback_done) {
+        send_wrapper->await_callback = false;
+        send_wrapper->ctx = NULL;
+        TAILQ_INSERT_TAIL(&send_wrapper->rqp->free_send, send_wrapper, link);
+    }
+}
+
 void
 rdma_send_resp(struct send_wr_wrapper_server *send_wrapper, uint64_t req_id, uint64_t request_group_id)
 {
     struct rdma_qp_server *rqp = send_wrapper->rqp;
     send_wrapper->await_callback = false;
+    send_wrapper->send_done = false;
+    send_wrapper->callback_done = true;
     send_wrapper->cs_resp->req_id = req_id;
     send_wrapper->cs_resp->request_group_id = request_group_id;
     struct ibv_send_wr *send_wr = &send_wrapper->send_wr;
@@ -1246,8 +1260,8 @@ req_handler_callback(struct recv_wr_wrapper_server *recv_wrapper)
     if (recv_wrapper_release != NULL) {
         run_state_machine(recv_wrapper_release,CALLBACK);
     }
-    send_wrapper_release->await_callback = false;
-    TAILQ_INSERT_TAIL(&send_wrapper_release->rqp->free_send, send_wrapper_release, link);
+    send_wrapper_release->callback_done = true;
+    raid5_free_send_wrapper_if_peer_done(send_wrapper_release);
     rdma_recv(recv_wrapper);
 }
 
@@ -1278,6 +1292,8 @@ poll_cq(void *arg)
             case IBV_WC_SEND:
                 send_wrapper = (struct send_wr_wrapper_server *) id;
                 if (send_wrapper->await_callback) {
+                    send_wrapper->send_done = true;
+                    raid5_free_send_wrapper_if_peer_done(send_wrapper);
                     break;
                 }
                 if (send_wrapper->ctx != NULL) {
@@ -2134,12 +2150,9 @@ main(int argc, char **argv)
     raid5_load_queue_depth_from_env();
     g_bdev_context->bdev_name = g_bdev_name;
 
-    std::ifstream addrs(g_addr_file, std::ios::in);
-    std::string ip_addr;
-    while(addrs>>ip_addr) {
-        ip_addrs.push_back(ip_addr);
+    if (!draid_load_private_ip_addrs(g_addr_file, ip_addrs, "dRAID raid5 server")) {
+        exit(1);
     }
-    addrs.close();
 
     /*
      * spdk_app_start() will initialize the SPDK framework, call bdev_start(),

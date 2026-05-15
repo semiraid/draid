@@ -204,6 +204,24 @@ rpc_bdev_raid_create(struct spdk_jsonrpc_request *request,
         goto cleanup;
     }
 
+    if (req.host_ip == nullptr || !draid_address_allowed(req.host_ip)) {
+        spdk_jsonrpc_send_error_response(
+                request,
+                EINVAL,
+                "DRAID_REQUIRE_INTERNAL_IP=1 requires host_ip to be an internal IPv4 or loopback address");
+        goto cleanup;
+    }
+    for (i = 0; i < req.base_rpcs.num_base_rpcs; i++) {
+        if (req.base_rpcs.base_rpcs[i].uri == nullptr ||
+            !draid_address_allowed(req.base_rpcs.base_rpcs[i].uri)) {
+            spdk_jsonrpc_send_error_response(
+                    request,
+                    EINVAL,
+                    "DRAID_REQUIRE_INTERNAL_IP=1 requires base_rpcs.uri to be an internal IPv4 or loopback address");
+            goto cleanup;
+        }
+    }
+
     rc = raid_bdev_config_add(req.name, req.strip_size_kb, (uint8_t)req.num_qp, req.base_rpcs.num_base_rpcs,
                               req.level, (uint8_t)req.num_parities,
                               &raid_cfg);

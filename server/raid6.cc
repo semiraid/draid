@@ -80,6 +80,8 @@ static struct ibv_cq* g_cq; // global CQ
 static struct rdma_qp_server *g_host_qp_list; // global host QP list
 static struct rdma_qp_server *g_server_qp_list; // global server QP list
 
+void rdma_recv(struct recv_wr_wrapper_server *recv_wrapper);
+
 static struct spdk_poller *g_poller;
 static uint64_t g_raid6_recv_post_retry_logs = 0;
 static uint64_t g_raid6_send_post_retry_logs = 0;
@@ -859,11 +861,13 @@ rdma_send_msg(struct send_wr_wrapper_server *send_wrapper, struct recv_wr_wrappe
     }
 
     /*
-     * Peer SENDs must be signaled so their SQ entries are reclaimed, but the
-     * foreground state machine is advanced by the peer callback, not by the
-     * local SEND completion.
+     * Peer SENDs are complete only after both the local SEND completion and
+     * the peer callback arrive. The two events can be observed in either
+     * order, so the wrapper must not return to free_send until both have fired.
      */
     send_wrapper->await_callback = true;
+    send_wrapper->send_done = false;
+    send_wrapper->callback_done = false;
     send_wr->send_flags = IBV_SEND_SIGNALED;
     send_wr->next = NULL;
     if (rqp->send_wrs.first == NULL) {
@@ -881,6 +885,8 @@ rdma_send_resp(struct send_wr_wrapper_server *send_wrapper, uint64_t req_id, uin
 {
     struct rdma_qp_server *rqp = send_wrapper->rqp;
     send_wrapper->await_callback = false;
+    send_wrapper->send_done = false;
+    send_wrapper->callback_done = true;
     send_wrapper->cs_resp->req_id = req_id;
     send_wrapper->cs_resp->request_group_id = request_group_id;
     struct ibv_send_wr *send_wr = &send_wrapper->send_wr;
@@ -898,6 +904,46 @@ rdma_send_resp(struct send_wr_wrapper_server *send_wrapper, uint64_t req_id, uin
         rqp->send_wrs.last = send_wr;
     }
     rqp->send_wrs.size++;
+}
+
+static void
+raid6_try_complete_forward_diff(struct recv_wr_wrapper_server *recv_wrapper)
+{
+    struct bdev_context_t *bdev_context = recv_wrapper->bdev_context;
+    struct rdma_qp_server *rqp;
+    struct send_wr_wrapper_server *send_wrapper;
+
+    if (!bdev_context->host_resp_sent &&
+        bdev_context->io_done &&
+        bdev_context->pending_peer_callbacks == 0) {
+        rqp = recv_wrapper->rqp;
+        send_wrapper = TAILQ_FIRST(&rqp->free_send);
+        if (spdk_unlikely(send_wrapper == NULL)) {
+            SPDK_ERRLOG("run out of send buffers\n");
+            assert(false);
+        }
+        TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
+        send_wrapper->ctx = NULL;
+        send_wrapper->await_callback = false;
+        rdma_send_resp(send_wrapper, recv_wrapper->cs_msg->req_id,
+                       recv_wrapper->cs_msg->request_group_id);
+        bdev_context->host_resp_sent = true;
+    }
+
+    if (bdev_context->host_resp_sent) {
+        bdev_context->state = RELEASE;
+        rdma_recv(recv_wrapper);
+    }
+}
+
+static void
+raid6_free_send_wrapper_if_peer_done(struct send_wr_wrapper_server *send_wrapper)
+{
+    if (send_wrapper->send_done && send_wrapper->callback_done) {
+        send_wrapper->await_callback = false;
+        send_wrapper->ctx = NULL;
+        TAILQ_INSERT_TAIL(&send_wrapper->rqp->free_send, send_wrapper, link);
+    }
 }
 
 void
@@ -1176,6 +1222,9 @@ run_state_machine(struct recv_wr_wrapper_server *recv_wrapper, enum action act)
                           bdev_context->buff2 + ((bdev_context->offset % g_strip_size) << bdev_context->blk_size_shift),
                           bdev_context->size << bdev_context->blk_size_shift);
             bdev_context->buff = bdev_context->buff2;
+            bdev_context->pending_peer_callbacks = 0;
+            bdev_context->io_done = false;
+            bdev_context->host_resp_sent = false;
             if (recv_wrapper->cs_msg->next_index >= 0) {
                 rqp = &g_server_qp_list[recv_wrapper->cs_msg->next_index];
                 send_wrapper = TAILQ_FIRST(&rqp->free_send);
@@ -1185,9 +1234,10 @@ run_state_machine(struct recv_wr_wrapper_server *recv_wrapper, enum action act)
                 }
                 TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
                 send_wrapper->ctx = recv_wrapper;
+                bdev_context->pending_peer_callbacks++;
                 rdma_send_msg(send_wrapper, recv_wrapper, PEER1);
             } else {
-                bdev_context->state = FW_DF_PEND3;
+                bdev_context->state = FW_DF_PEND2;
             }
             if (recv_wrapper->cs_msg->next_index2 >= 0) {
                 rqp = &g_server_qp_list[recv_wrapper->cs_msg->next_index2];
@@ -1198,53 +1248,39 @@ run_state_machine(struct recv_wr_wrapper_server *recv_wrapper, enum action act)
                 }
                 TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
                 send_wrapper->ctx = recv_wrapper;
+                bdev_context->pending_peer_callbacks++;
                 rdma_send_msg(send_wrapper, recv_wrapper, PEER2);
             } else {
-                bdev_context->state = FW_DF_PEND3;
+                bdev_context->state = FW_DF_PEND2;
             }
             bdev_write((void*) recv_wrapper);
             break;
         case FW_DF_PEND2:
-            bdev_context->state = FW_DF_PEND3;
             if (act == IO_COMPLETE) {
-                rqp = recv_wrapper->rqp;
-                send_wrapper = TAILQ_FIRST(&rqp->free_send);
-                if (spdk_unlikely(send_wrapper == NULL)) {
-                    SPDK_ERRLOG("run out of send buffers\n");
-                    assert(false);
-                }
-                TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
-                send_wrapper->ctx = recv_wrapper;
-                rdma_send_resp(send_wrapper, recv_wrapper->cs_msg->req_id, recv_wrapper->cs_msg->request_group_id);
+                bdev_context->io_done = true;
+            } else if (act == CALLBACK) {
+                assert(bdev_context->pending_peer_callbacks > 0);
+                bdev_context->pending_peer_callbacks--;
             }
+            raid6_try_complete_forward_diff(recv_wrapper);
             break;
         case FW_DF_PEND3:
-            bdev_context->state = FW_DF_PEND4;
             if (act == IO_COMPLETE) {
-                rqp = recv_wrapper->rqp;
-                send_wrapper = TAILQ_FIRST(&rqp->free_send);
-                if (spdk_unlikely(send_wrapper == NULL)) {
-                    SPDK_ERRLOG("run out of send buffers\n");
-                    assert(false);
-                }
-                TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
-                send_wrapper->ctx = recv_wrapper;
-                rdma_send_resp(send_wrapper, recv_wrapper->cs_msg->req_id, recv_wrapper->cs_msg->request_group_id);
+                bdev_context->io_done = true;
+            } else if (act == CALLBACK) {
+                assert(bdev_context->pending_peer_callbacks > 0);
+                bdev_context->pending_peer_callbacks--;
             }
+            raid6_try_complete_forward_diff(recv_wrapper);
             break;
         case FW_DF_PEND4:
-            bdev_context->state = RELEASE;
             if (act == IO_COMPLETE) {
-                rqp = recv_wrapper->rqp;
-                send_wrapper = TAILQ_FIRST(&rqp->free_send);
-                if (spdk_unlikely(send_wrapper == NULL)) {
-                    SPDK_ERRLOG("run out of send buffers\n");
-                    assert(false);
-                }
-                TAILQ_REMOVE(&rqp->free_send, send_wrapper, link);
-                send_wrapper->ctx = recv_wrapper;
-                rdma_send_resp(send_wrapper, recv_wrapper->cs_msg->req_id, recv_wrapper->cs_msg->request_group_id);
+                bdev_context->io_done = true;
+            } else if (act == CALLBACK) {
+                assert(bdev_context->pending_peer_callbacks > 0);
+                bdev_context->pending_peer_callbacks--;
             }
+            raid6_try_complete_forward_diff(recv_wrapper);
             break;
         case FW_MIX_START:
             bdev_context->state = FW_MIX_PEND1;
@@ -2358,8 +2394,8 @@ req_handler_callback(struct recv_wr_wrapper_server *recv_wrapper)
     if (recv_wrapper_release != NULL) {
         run_state_machine(recv_wrapper_release,CALLBACK);
     }
-    send_wrapper_release->await_callback = false;
-    TAILQ_INSERT_TAIL(&send_wrapper_release->rqp->free_send, send_wrapper_release, link);
+    send_wrapper_release->callback_done = true;
+    raid6_free_send_wrapper_if_peer_done(send_wrapper_release);
     rdma_recv(recv_wrapper);
 }
 
@@ -2390,6 +2426,8 @@ poll_cq(void *arg)
             case IBV_WC_SEND:
                 send_wrapper = (struct send_wr_wrapper_server *) id;
                 if (send_wrapper->await_callback) {
+                    send_wrapper->send_done = true;
+                    raid6_free_send_wrapper_if_peer_done(send_wrapper);
                     break;
                 }
                 if (send_wrapper->ctx != NULL) {
@@ -3297,12 +3335,9 @@ main(int argc, char **argv)
     raid6_load_queue_depth_from_env();
     g_bdev_context->bdev_name = g_bdev_name;
 
-    std::ifstream addrs(g_addr_file, std::ios::in);
-    std::string ip_addr;
-    while(addrs>>ip_addr) {
-        ip_addrs.push_back(ip_addr);
+    if (!draid_load_private_ip_addrs(g_addr_file, ip_addrs, "dRAID raid6 server")) {
+        exit(1);
     }
-    addrs.close();
 
     /*
      * spdk_app_start() will initialize the SPDK framework, call bdev_start(),

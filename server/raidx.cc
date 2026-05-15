@@ -2465,12 +2465,9 @@ main(int argc, char **argv)
     raidx_load_queue_depth_from_env();
     g_bdev_context->bdev_name = g_bdev_name;
 
-    std::ifstream addrs(g_addr_file, std::ios::in);
-    std::string ip_addr;
-    while(addrs>>ip_addr) {
-        ip_addrs.push_back(ip_addr);
+    if (!draid_load_private_ip_addrs(g_addr_file, ip_addrs, "dRAID raidx server")) {
+        exit(1);
     }
-    addrs.close();
 
     /*
      * spdk_app_start() will initialize the SPDK framework, call bdev_start(),

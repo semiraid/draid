@@ -170,6 +170,8 @@ struct send_wr_wrapper_server {
     struct ibv_send_wr send_wr_write[16];
     struct recv_wr_wrapper_server *ctx;
     bool await_callback;
+    bool send_done;
+    bool callback_done;
     TAILQ_ENTRY(send_wr_wrapper_server) link;
 };
 
@@ -379,6 +381,76 @@ static inline void bind_to_core(std::thread &thread, size_t numa_node,
 
 static std::string g_host_ip_addr = "192.168.2.1";
 static uint8_t g_phy_port = 2;
+
+static inline bool draid_is_private_or_loopback_ipv4(const std::string &ip_addr)
+{
+    struct in_addr parsed = {};
+    if (inet_pton(AF_INET, ip_addr.c_str(), &parsed) != 1) {
+        return false;
+    }
+    const uint32_t value = ntohl(parsed.s_addr);
+    const uint8_t a = static_cast<uint8_t>((value >> 24) & 0xff);
+    const uint8_t b = static_cast<uint8_t>((value >> 16) & 0xff);
+    if (a == 10 || a == 127) {
+        return true;
+    }
+    if (a == 192 && b == 168) {
+        return true;
+    }
+    if (a == 172 && b >= 16 && b <= 31) {
+        return true;
+    }
+    return false;
+}
+
+static inline bool draid_env_truthy(const char *value)
+{
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    const std::string text(value);
+    return text == "1" || text == "true" || text == "TRUE" || text == "yes" ||
+           text == "YES" || text == "on" || text == "ON";
+}
+
+static inline bool draid_require_internal_ip(void)
+{
+    return draid_env_truthy(getenv("DRAID_REQUIRE_INTERNAL_IP"));
+}
+
+static inline bool draid_address_allowed(const std::string &ip_addr)
+{
+    return !draid_require_internal_ip() || draid_is_private_or_loopback_ipv4(ip_addr);
+}
+
+static inline bool draid_load_private_ip_addrs(const char *addr_file,
+                                               std::vector<std::string> &ip_addrs,
+                                               const char *label)
+{
+    std::ifstream addrs(addr_file, std::ios::in);
+    std::string ip_addr;
+    ip_addrs.clear();
+    if (!addrs.is_open()) {
+        SPDK_ERRLOG("%s failed to open addr_file=%s\n", label, addr_file);
+        return false;
+    }
+    while (addrs >> ip_addr) {
+        if (!draid_address_allowed(ip_addr)) {
+            SPDK_ERRLOG(
+                    "%s refuses non-internal address %s from %s because "
+                    "DRAID_REQUIRE_INTERNAL_IP=1; use experiment-network IPs, "
+                    "not hostname/public/control IPs\n",
+                    label, ip_addr.c_str(), addr_file);
+            return false;
+        }
+        ip_addrs.push_back(ip_addr);
+    }
+    if (ip_addrs.empty()) {
+        SPDK_ERRLOG("%s addr_file is empty: %s\n", label, addr_file);
+        return false;
+    }
+    return true;
+}
 
 static inline uint8_t get_phy_port(void)
 {
